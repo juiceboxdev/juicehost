@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-/// Errors raised while loading environment configuration.
+/// Errors that could happen while loading environment configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("{name} must be a number")]
