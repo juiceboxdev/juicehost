@@ -42,10 +42,10 @@ pub enum ConfigError {
     MissingQuicPort,
     #[error("{name} must be true, false, 1, or 0")]
     InvalidBoolean { name: &'static str },
-    #[error("ALLOWED_TTL_HOURS contains an invalid number")]
-    InvalidAllowedTtl,
-    #[error("DEFAULT_TTL_HOURS must be a number")]
-    InvalidDefaultTtl,
+    #[error("ALLOWED_TTL_HOURS contains an invalid number: {0}")]
+    InvalidAllowedTtl(#[source] std::num::ParseFloatError),
+    #[error("DEFAULT_TTL_HOURS must be a number: {0}")]
+    InvalidDefaultTtl(#[from] std::num::ParseFloatError),
     #[error("TTL values must be finite, positive, and include DEFAULT_TTL_HOURS")]
     InvalidTtlConfiguration,
     #[error("{0}")]
@@ -244,13 +244,13 @@ impl Config {
             .map(|s| {
                 s.trim()
                     .parse::<f64>()
-                    .map_err(|_| ConfigError::InvalidAllowedTtl)
+                    .map_err(ConfigError::InvalidAllowedTtl)
             })
             .collect::<Result<_, _>>()?;
 
         let default_ttl_hours = std::env::var("DEFAULT_TTL_HOURS")
             .ok()
-            .map(|v| v.parse::<f64>().map_err(|_| ConfigError::InvalidDefaultTtl))
+            .map(|v| v.parse::<f64>())
             .transpose()?
             .unwrap_or(24.0);
 
