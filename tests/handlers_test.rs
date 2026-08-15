@@ -812,6 +812,174 @@ async fn internal_endpoints_open_when_no_api_key_configured() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+async fn capability_state(dir: &std::path::Path) -> Arc<AppState> {
+    let mut config = test_config("", None);
+    config.api_key.clear();
+    let backend = Arc::new(LocalBackend::new(dir.to_path_buf(), 0).unwrap());
+    backend.init_cache().await.unwrap();
+    Arc::new(AppState::new(&config, backend))
+}
+
+#[tokio::test]
+async fn unpaired_host_requires_file_capability_for_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = build_router(capability_state(dir.path()).await);
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/file/stream/cap-delete/file.txt")
+                .header("x-juicehost-file-capability", "owner-secret")
+                .body(Body::from("data"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    for capability in [None, Some("wrong-secret")] {
+        let mut request = Request::builder()
+            .method("DELETE")
+            .uri("/internal/file/cap-delete");
+        if let Some(capability) = capability {
+            request = request.header("x-juicehost-file-capability", capability);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/internal/file/cap-delete")
+                .header("x-juicehost-file-capability", "owner-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn file_capability_survives_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = build_router(capability_state(dir.path()).await);
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/file/stream/cap-old/file.txt")
+                .header("x-juicehost-file-capability", "rename-secret")
+                .body(Body::from("data"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let rename = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/file/cap-old/rename")
+                .header("content-type", "application/json")
+                .header("x-juicehost-file-capability", "rename-secret")
+                .body(Body::from(r#"{"new_id":"cap-new"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rename.status(), StatusCode::OK);
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/internal/file/cap-new")
+                .header("x-juicehost-file-capability", "rename-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn concat_requires_shared_part_capability() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = build_router(capability_state(dir.path()).await);
+    for (id, body) in [("cap-part-a", "a"), ("cap-part-b", "b")] {
+        let upload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/internal/file/stream/{id}/file.txt"))
+                    .header("x-juicehost-file-capability", "concat-secret")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::OK);
+    }
+
+    let request_body =
+        r#"{"target_id":"cap-merged","filename":"file.txt","parts":["cap-part-a","cap-part-b"]}"#;
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/file/concat")
+                .header("content-type", "application/json")
+                .header("x-juicehost-file-capability", "wrong-secret")
+                .body(Body::from(request_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+    let accepted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/file/concat")
+                .header("content-type", "application/json")
+                .header("x-juicehost-file-capability", "concat-secret")
+                .body(Body::from(request_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/internal/file/cap-merged")
+                .header("x-juicehost-file-capability", "concat-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+}
+
 #[tokio::test]
 async fn streaming_blocks_magic_bytes() {
     let dir = tempfile::tempdir().unwrap();

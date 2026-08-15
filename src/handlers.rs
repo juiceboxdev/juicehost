@@ -16,6 +16,30 @@ use crate::error::{not_found_html, teapot_html, JuicehostError};
 use crate::state::AppState;
 use crate::storage;
 
+fn optional_file_capability(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-juicehost-file-capability")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn required_file_capability(
+    headers: &HeaderMap,
+    api_key: &str,
+) -> Result<Option<String>, JuicehostError> {
+    let has_api_key = headers
+        .get("x-juicehost-api-key")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|provided| juiceutils::constant_time_eq(api_key, provided));
+    if !api_key.is_empty() && has_api_key {
+        return Ok(None);
+    }
+    optional_file_capability(headers)
+        .ok_or(JuicehostError::Forbidden)
+        .map(Some)
+}
+
 /// Maximum Cache-Control max-age for immutable file responses (1 year in seconds).
 const CACHE_MAX_AGE: &str = "public, max-age=31536000, immutable";
 
@@ -278,6 +302,7 @@ fn parse_range(range_val: &str, total_size: u64, max_len: u64) -> RangeResult {
 #[tracing::instrument(skip_all)]
 pub async fn store_file(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, JuicehostError> {
     let _permit = Arc::clone(&state.upload_semaphore)
@@ -331,15 +356,32 @@ pub async fn store_file(
         &format!("(id={file_id})"),
     )?;
 
-    state
-        .storage
-        .put(
-            &file_id,
-            &content_filename(&filename, infer::get(&data).as_ref()),
-            data,
-        )
-        .await
-        .map_err(JuicehostError::from)?;
+    let capability = optional_file_capability(&headers);
+
+    match capability {
+        Some(cap) => {
+            state
+                .storage
+                .put_with_capability(
+                    &file_id,
+                    &content_filename(&filename, infer::get(&data).as_ref()),
+                    data,
+                    &cap,
+                )
+                .await
+        }
+        None => {
+            state
+                .storage
+                .put(
+                    &file_id,
+                    &content_filename(&filename, infer::get(&data).as_ref()),
+                    data,
+                )
+                .await
+        }
+    }
+    .map_err(JuicehostError::from)?;
 
     tracing::info!("stored file: {} ({})", file_id, filename);
 
@@ -365,6 +407,7 @@ pub async fn store_file(
 )]
 pub async fn rename_file(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, JuicehostError> {
@@ -377,11 +420,18 @@ pub async fn rename_file(
         return Err(JuicehostError::BadRequest);
     }
 
-    state
-        .storage
-        .rename(&id, new_id)
-        .await
-        .map_err(JuicehostError::from)?;
+    let capability = required_file_capability(&headers, &state.api_key)?;
+
+    match capability {
+        Some(cap) => {
+            state
+                .storage
+                .rename_with_capability(&id, new_id, &cap)
+                .await
+        }
+        None => state.storage.rename(&id, new_id).await,
+    }
+    .map_err(JuicehostError::from)?;
 
     tracing::info!("renamed file: {} -> {}", id, new_id);
 
@@ -408,13 +458,16 @@ pub async fn rename_file(
 )]
 pub async fn delete_file(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, JuicehostError> {
-    let deleted = state
-        .storage
-        .delete(&id)
-        .await
-        .map_err(JuicehostError::from)?;
+    let capability = required_file_capability(&headers, &state.api_key)?;
+
+    let deleted = match capability {
+        Some(cap) => state.storage.delete_with_capability(&id, &cap).await,
+        None => state.storage.delete(&id).await,
+    }
+    .map_err(JuicehostError::from)?;
 
     if !deleted {
         return Err(JuicehostError::NotFound);
@@ -549,7 +602,7 @@ fn content_filename(filename: &str, detected: Option<&infer::Type>) -> String {
 pub async fn store_file_streaming(
     State(state): State<Arc<AppState>>,
     Path((id, filename)): Path<(String, String)>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: axum::body::Body,
 ) -> Result<Json<serde_json::Value>, JuicehostError> {
     if !is_valid_id(&id) {
@@ -561,15 +614,28 @@ pub async fn store_file_streaming(
         .map_err(|_| JuicehostError::ServiceUnavailable)?;
     let handler_start = std::time::Instant::now();
 
+    let capability = optional_file_capability(&headers);
+
     let (body, detected) = sniff_and_validate(body, &filename, state.danger_level).await?;
     let max_size = state.max_file_size_bytes;
     let stream = sized_stream(body, max_size, None);
     let storage_filename = content_filename(&filename, detected.as_ref());
-    let total = state
-        .storage
-        .put_stream(&id, &storage_filename, Box::pin(stream))
-        .await
-        .map_err(JuicehostError::from)?;
+
+    let total = match capability {
+        Some(cap) => {
+            state
+                .storage
+                .put_stream_with_capability(&id, &storage_filename, Box::pin(stream), &cap)
+                .await
+        }
+        None => {
+            state
+                .storage
+                .put_stream(&id, &storage_filename, Box::pin(stream))
+                .await
+        }
+    }
+    .map_err(JuicehostError::from)?;
 
     let total_time = handler_start.elapsed();
     let bytes_per_sec = if total_time.as_secs_f64() > 0.0 {
@@ -680,6 +746,7 @@ pub async fn storage_handler(State(state): State<Arc<AppState>>) -> Json<storage
 )]
 pub async fn concat_files(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, JuicehostError> {
     let target_id = payload
@@ -727,11 +794,18 @@ pub async fn concat_files(
         .try_acquire_owned()
         .map_err(|_| JuicehostError::ServiceUnavailable)?;
 
-    state
-        .storage
-        .concat(target_id, filename, &parts)
-        .await
-        .map_err(JuicehostError::from)?;
+    let capability = required_file_capability(&headers, &state.api_key)?;
+
+    match capability {
+        Some(cap) => {
+            state
+                .storage
+                .concat_with_capability(target_id, filename, &parts, &cap)
+                .await
+        }
+        None => state.storage.concat(target_id, filename, &parts).await,
+    }
+    .map_err(JuicehostError::from)?;
 
     tracing::info!("concat: {} <- {:?} ({})", target_id, parts, filename);
 
@@ -797,6 +871,7 @@ pub async fn store_file_ticket(
         file_id: String,
         filename: String,
         file_size: u64,
+        file_capability: Option<String>,
     }
 
     use jsonwebtoken::{decode, DecodingKey};
@@ -839,14 +914,31 @@ pub async fn store_file_ticket(
 
     let handler_start = std::time::Instant::now();
 
+    let capability = ticket
+        .claims
+        .file_capability
+        .clone()
+        .or_else(|| optional_file_capability(&headers));
+
     let (body, detected) = sniff_and_validate(body, &real_filename, state.danger_level).await?;
     let stream = sized_stream(body, ticket.claims.file_size, Some(ticket.claims.file_size));
     let storage_filename = content_filename(&real_filename, detected.as_ref());
-    let total = state
-        .storage
-        .put_stream(&id, &storage_filename, Box::pin(stream))
-        .await
-        .map_err(JuicehostError::from)?;
+
+    let total = match capability {
+        Some(cap) => {
+            state
+                .storage
+                .put_stream_with_capability(&id, &storage_filename, Box::pin(stream), &cap)
+                .await
+        }
+        None => {
+            state
+                .storage
+                .put_stream(&id, &storage_filename, Box::pin(stream))
+                .await
+        }
+    }
+    .map_err(JuicehostError::from)?;
 
     let total_time = handler_start.elapsed();
     let bytes_per_sec = if total_time.as_secs_f64() > 0.0 {

@@ -89,7 +89,7 @@ Public endpoints:
 | `GET` | `/api/config` | Public upload capabilities and limits |
 | `GET` | `/api/openapi.json` | OpenAPI document |
 
-Internal endpoints require `X-Juicehost-API-Key` unless `JUICEHOST_API_KEY` is unset (authentication disabled). `POST /internal/file/upload/:id` also accepts a signed bearer ticket.
+Internal endpoints accept `X-Juicehost-API-Key` when the instance is paired. User-selected hosts can instead receive an `X-Juicehost-File-Capability` during upload; the same per-file capability is then required for delete, rename, and concat. `POST /internal/file/upload/:id` also accepts a signed bearer ticket, which can carry the capability without exposing it as an unsigned browser header.
 
 | Method | Path | Description |
 |--------|------|-------------|
