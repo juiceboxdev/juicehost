@@ -1,0 +1,47 @@
+[package]
+name = "juicehost"
+version = "1.0.0"
+edition = "2021"
+authors = ["juiceydev"]
+description = "File storage and delivery service for Juicebox"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/juiceboxdev/juicehost"
+readme = "README.md"
+publish = false
+
+[features]
+default = ["quic"]
+quic = [
+    "juiceutils/quic",
+]
+
+[dependencies]
+axum = { version = "0.7", features = ["multipart", "ws"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.4", features = ["limit", "util"] }
+tower-http = { version = "0.5", features = ["fs", "trace", "compression-gzip", "compression-br", "compression-zstd", "limit", "cors", "timeout"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+mimalloc = "0.1"
+dotenvy = "0.15"
+reqwest = { version = "0.12", features = ["multipart", "stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mime_guess = "2"
+infer = "0.22"
+dashmap = "6.0"
+fs2 = "0.4"
+futures = "0.3"
+bytes = "1"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs"] }
+libc = "0.2"
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
+async-trait = "0.1"
+utoipa = { version = "5", features = ["axum_extras"] }
+sentry = { version = "0.48", features = ["tower", "tower-axum-matched-path"] }
+sentry-tracing = "0.48"
+juiceutils = { path = "juiceutils" }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.4", features = ["util"] }

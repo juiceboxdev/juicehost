@@ -1,0 +1,3 @@
+[submodule "juiceutils"]
+	path = juiceutils
+	url = https://github.com/juiceboxdev/juiceutils.git

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Uploading - __TITLE_FILENAME__</title>
+  <meta property="og:title" content="__OG_TITLE__">
+  <meta property="og:description" content="__OG_DESCRIPTION__">
+  <meta property="og:image" content="__OG_IMAGE__">
+  <meta property="og:url" content="__PUBLIC_URL__">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="__OG_TITLE__">
+  <meta name="twitter:description" content="__OG_DESCRIPTION__">
+  <meta name="twitter:image" content="__OG_IMAGE__">
+  <meta http-equiv="refresh" content="__RETRY_AFTER__">
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{
+      background:#0a0908;
+      color:#d5c7bc;
+      font-family:system-ui,-apple-system,sans-serif;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      min-height:100vh;
+      padding:1.5rem;
+    }
+    .wrap{text-align:center;max-width:28rem}
+    .emoji{font-size:3rem;margin-bottom:1rem;line-height:1}
+    h1{
+      font-size:1.5rem;
+      color:#f5edea;
+      font-weight:700;
+      margin-bottom:.5rem;
+    }
+    p{
+      color:#a29188;
+      font-size:1rem;
+      line-height:1.6;
+    }
+    .spinner{
+      margin:1.5rem auto;
+      width:32px;
+      height:32px;
+      border:3px solid #2a2320;
+      border-top-color:#f97316;
+      border-radius:50%;
+      animation:spin 1s linear infinite;
+    }
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .url{
+      word-break:break-all;
+      font-size:.85rem;
+      color:#a29188;
+      margin-top:1rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="emoji">&#127868;</div>
+    <h1>still uploading&hellip;</h1>
+    <p>This file is being uploaded right now. Hang tight and this page will refresh automatically!</p>
+    <div class="spinner"></div>
+    <p class="url">__PUBLIC_URL__</p>
+  </div>
+</body>
+</html>
