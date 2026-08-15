@@ -2,6 +2,9 @@
 
 use std::path::PathBuf;
 
+use juiceutils::file_validation::ProtectionLevel;
+use juiceutils::proxy::parse_trusted_proxy_cidrs;
+
 /// Holds every setting juicehost needs to run.
 // If any missing in .env.example, tell me.
 #[derive(Debug, Clone)]
@@ -77,11 +80,29 @@ where
     Ok(value)
 }
 
-impl Config {
-    /// Load configuration from environment variables.
-    pub fn from_env() -> Result<Self, String> {
-        let public_host = std::env::var("PUBLIC_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let public_port = std::env::var("PUBLIC_PORT")
+// We say thank you to orng.
+fn env_bool(name: &str, default: bool) -> Result<bool, String> {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Ok(true),
+            "0" | "false" => Ok(false),
+            _ => Err(format!("{name} must be true, false, 1, or 0")),
+        },
+        Err(_) => Ok(default),
+    }
+}
+
+/// Public HTTP listener settings.
+#[derive(Debug)]
+struct PublicSettings {
+    host: String,
+    port: u16,
+}
+
+impl PublicSettings {
+    fn from_env() -> Result<Self, String> {
+        let host = std::env::var("PUBLIC_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port = std::env::var("PUBLIC_PORT")
             .ok()
             .map(|p| {
                 p.parse::<u16>()
@@ -89,8 +110,27 @@ impl Config {
             })
             .transpose()?
             .unwrap_or(6402);
-        let quic_host = std::env::var("QUIC_HOST").unwrap_or_else(|_| public_host.clone());
-        let quic_port = std::env::var("QUIC_PORT")
+        Ok(Self { host, port })
+    }
+}
+
+/// QUIC/HTTP/3 listener and limit settings.
+#[derive(Debug)]
+struct QuicSettings {
+    host: String,
+    port: u16,
+    cert_path: PathBuf,
+    max_connections: usize,
+    max_requests: usize,
+    handshake_seconds: u64,
+    idle_seconds: u64,
+    request_total_seconds: u64,
+}
+
+impl QuicSettings {
+    fn from_env(public: &PublicSettings) -> Result<Self, String> {
+        let host = std::env::var("QUIC_HOST").unwrap_or_else(|_| public.host.clone());
+        let port = std::env::var("QUIC_PORT")
             .ok()
             .map(|p| {
                 p.parse::<u16>()
@@ -98,11 +138,58 @@ impl Config {
             })
             .transpose()?
             .unwrap_or(
-                public_port
+                public
+                    .port
                     .checked_add(1)
                     .ok_or("QUIC_PORT must be set when PUBLIC_PORT is 65535")?,
             );
-        let worker_threads = bounded_env("WORKER_THREADS", 3usize, 1, 256)?;
+        let cert_path = std::env::var("QUIC_CERT_PATH")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("./quic-cert.der"));
+        let max_connections = bounded_env("QUIC_MAX_CONNECTIONS", 256usize, 1, 65_536)?;
+        let max_requests = bounded_env("QUIC_MAX_REQUESTS", 256usize, 1, 65_536)?;
+        let handshake_seconds = bounded_env("QUIC_HANDSHAKE_SECONDS", 10u64, 1, 120)?;
+        let idle_seconds = bounded_env("QUIC_IDLE_SECONDS", 30u64, 1, 600)?;
+        let request_total_seconds = bounded_env("QUIC_REQUEST_TOTAL_SECONDS", 600u64, 1, 86_400)?;
+        Ok(Self {
+            host,
+            port,
+            cert_path,
+            max_connections,
+            max_requests,
+            handshake_seconds,
+            idle_seconds,
+            request_total_seconds,
+        })
+    }
+}
+
+/// Tokio worker thread settings.
+#[derive(Debug)]
+struct ThreadSettings {
+    worker_threads: usize,
+}
+
+impl ThreadSettings {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            worker_threads: bounded_env("WORKER_THREADS", 3usize, 1, 256)?,
+        })
+    }
+}
+
+/// Local directory and peer URL settings.
+#[derive(Debug)]
+struct DirectorySettings {
+    files_dir: PathBuf,
+    backend_url: Option<String>,
+    frontend_url: Option<String>,
+}
+
+impl DirectorySettings {
+    fn from_env() -> Self {
         let files_dir = std::env::var("FILES_DIR")
             .unwrap_or_else(|_| "./files".to_string())
             .into();
@@ -110,11 +197,29 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty() && s.trim() != "none")
             .map(|s| s.trim_end_matches('/').to_string());
-
         let frontend_url = std::env::var("FRONTEND_URL")
             .ok()
             .filter(|s| !s.trim().is_empty() && s.trim() != "none")
             .map(|s| s.trim_end_matches('/').to_string());
+        Self {
+            files_dir,
+            backend_url,
+            frontend_url,
+        }
+    }
+}
+
+/// Internal API authentication, origin, and validation settings.
+#[derive(Debug)]
+struct SecuritySettings {
+    api_key: String,
+    allowed_origins: Vec<String>,
+    danger_level: ProtectionLevel,
+    trusted_proxy_cidrs: Vec<juiceutils::proxy::IpCidr>,
+}
+
+impl SecuritySettings {
+    fn from_env(directories: &DirectorySettings) -> Result<Self, String> {
         let api_key = std::env::var("JUICEHOST_API_KEY")
             .unwrap_or_default()
             .trim()
@@ -128,53 +233,129 @@ impl Config {
                     .collect()
             })
             .unwrap_or_else(|| {
-                backend_url
+                directories
+                    .backend_url
                     .as_ref()
                     .map(|b| vec![b.clone()])
                     .unwrap_or_default()
             });
-
-        let min_free_space_gb = std::env::var("MIN_FREE_SPACE_GB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(5);
-        let min_free_space_bytes = min_free_space_gb * 1024 * 1024 * 1024;
-
-        let s3_bucket = std::env::var("S3_BUCKET")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        let s3_region = std::env::var("S3_REGION")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        let s3_endpoint = std::env::var("S3_ENDPOINT")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        let s3_allow_http = env_bool("S3_ALLOW_HTTP", false)?;
-        let s3_access_key = std::env::var("S3_ACCESS_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        let s3_secret_key = std::env::var("S3_SECRET_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-
-        let max_file_size_mb = bounded_env("MAX_FILE_SIZE_MB", 500u64, 1, 1024 * 1024)?;
-        let max_file_size_bytes = max_file_size_mb * 1024 * 1024;
-
-        let quick_link = env_bool("QUICK_LINK", true)?;
-        let custom_id = env_bool("CUSTOM_ID", true)?;
-
-        let danger_level = juiceutils::file_validation::ProtectionLevel::parse(
+        let danger_level = ProtectionLevel::parse(
             &std::env::var("DANGER_LEVEL").unwrap_or_else(|_| "high".to_string()),
         );
+        let trusted_proxy_cidrs =
+            parse_trusted_proxy_cidrs(&std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default())?;
+        Ok(Self {
+            api_key,
+            allowed_origins,
+            danger_level,
+            trusted_proxy_cidrs,
+        })
+    }
+}
 
-        let quic_cert_path = Some(
-            std::env::var("QUIC_CERT_PATH")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("./quic-cert.der")),
-        );
+/// S3-compatible backend settings.
+#[derive(Debug)]
+struct S3Settings {
+    bucket: Option<String>,
+    region: Option<String>,
+    endpoint: Option<String>,
+    allow_http: bool,
+    access_key: Option<String>,
+    secret_key: Option<String>,
+}
 
+impl S3Settings {
+    fn from_env() -> Result<Self, String> {
+        let bucket = std::env::var("S3_BUCKET")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let region = std::env::var("S3_REGION")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let endpoint = std::env::var("S3_ENDPOINT")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let allow_http = env_bool("S3_ALLOW_HTTP", false)?;
+        let access_key = std::env::var("S3_ACCESS_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let secret_key = std::env::var("S3_SECRET_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        Ok(Self {
+            bucket,
+            region,
+            endpoint,
+            allow_http,
+            access_key,
+            secret_key,
+        })
+    }
+}
+
+/// Concurrency and timeout limit settings.
+#[derive(Debug)]
+struct LimitsSettings {
+    min_free_space_bytes: u64,
+    max_file_size_bytes: u64,
+    max_range_response_bytes: u64,
+    max_concurrent_uploads: usize,
+    max_concurrent_downloads: usize,
+    max_concat_parts: usize,
+    tcp_body_inactivity_seconds: u64,
+    tcp_request_total_seconds: u64,
+    tcp_max_concurrent_requests: usize,
+}
+// I KNOW THERE'S A BETTER WAY TO DO THIS DON'T BLAME ME FOR THIS.
+impl LimitsSettings {
+    fn from_env() -> Result<Self, String> {
+        let min_free_space_bytes = std::env::var("MIN_FREE_SPACE_GB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5)
+            * 1024
+            * 1024
+            * 1024;
+        let max_file_size_bytes =
+            bounded_env("MAX_FILE_SIZE_MB", 500u64, 1, 1024 * 1024)? * 1024 * 1024;
+        let max_range_response_bytes =
+            bounded_env("MAX_RANGE_RESPONSE_MB", 16u64, 1, 1024)? * 1024 * 1024;
+        let max_concurrent_uploads = bounded_env("MAX_CONCURRENT_UPLOADS", 16usize, 1, 4096)?;
+        let max_concurrent_downloads = bounded_env("MAX_CONCURRENT_DOWNLOADS", 64usize, 1, 4096)?;
+        let max_concat_parts = bounded_env("MAX_CONCAT_PARTS", 128usize, 1, 4096)?;
+        let tcp_body_inactivity_seconds =
+            bounded_env("TCP_BODY_INACTIVITY_SECONDS", 30u64, 1, 3600)?;
+        let tcp_request_total_seconds =
+            bounded_env("TCP_REQUEST_TOTAL_SECONDS", 600u64, 1, 86_400)?;
+        let tcp_max_concurrent_requests =
+            bounded_env("TCP_MAX_CONCURRENT_REQUESTS", 512usize, 1, 65_536)?;
+        Ok(Self {
+            min_free_space_bytes,
+            max_file_size_bytes,
+            max_range_response_bytes,
+            max_concurrent_uploads,
+            max_concurrent_downloads,
+            max_concat_parts,
+            tcp_body_inactivity_seconds,
+            tcp_request_total_seconds,
+            tcp_max_concurrent_requests,
+        })
+    }
+}
+
+/// Feature toggle and TTL settings.
+#[derive(Debug)]
+struct FeatureSettings {
+    quick_link: bool,
+    custom_id: bool,
+    default_ttl_hours: f64,
+    allowed_ttl_hours: Vec<f64>,
+}
+
+impl FeatureSettings {
+    fn from_env() -> Result<Self, String> {
+        let quick_link = env_bool("QUICK_LINK", true)?;
+        let custom_id = env_bool("CUSTOM_ID", true)?;
         let allowed_ttl_hours: Vec<f64> = std::env::var("ALLOWED_TTL_HOURS")
             .unwrap_or_else(|_| "0.5,1,6,12,24,72,168".into())
             .split(',')
@@ -184,7 +365,6 @@ impl Config {
                     .map_err(|_| "ALLOWED_TTL_HOURS contains an invalid number")
             })
             .collect::<Result<_, _>>()?;
-
         let default_ttl_hours = std::env::var("DEFAULT_TTL_HOURS")
             .ok()
             .map(|v| {
@@ -207,106 +387,126 @@ impl Config {
             );
         }
 
-        let ticket_jwt_secret = std::env::var("TICKET_JWT_SECRET")
-            .unwrap_or_else(|_| std::env::var("JWT_SECRET").unwrap_or_else(|_| api_key.clone()));
+        Ok(Self {
+            quick_link,
+            custom_id,
+            default_ttl_hours,
+            allowed_ttl_hours,
+        })
+    }
+}
 
+/// Signing secrets and ban pepper settings.
+#[derive(Debug)]
+struct SecretSettings {
+    ticket_jwt_secret: String,
+    ip_pepper: String,
+}
+
+impl SecretSettings {
+    fn from_env(security: &SecuritySettings) -> Self {
+        let ticket_jwt_secret = std::env::var("TICKET_JWT_SECRET").unwrap_or_else(|_| {
+            std::env::var("JWT_SECRET").unwrap_or_else(|_| security.api_key.clone())
+        });
         let ip_pepper = std::env::var("IP_PEPPER").unwrap_or_default();
+        Self {
+            ticket_jwt_secret,
+            ip_pepper,
+        }
+    }
+}
 
-        let ban_list_file = std::env::var("BAN_LIST_FILE")
+/// IP ban list and backend sync settings.
+#[derive(Debug)]
+struct BanSettings {
+    list_file: Option<PathBuf>,
+    sync_url: Option<String>,
+    sync_interval: u64,
+}
+
+impl BanSettings {
+    fn from_env() -> Self {
+        let list_file = std::env::var("BAN_LIST_FILE")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .map(PathBuf::from);
-
-        let ban_sync_url = std::env::var("BAN_SYNC_URL")
+        let sync_url = std::env::var("BAN_SYNC_URL")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.trim_end_matches('/').to_string());
-
-        let ban_sync_interval = std::env::var("BAN_SYNC_INTERVAL")
+        let sync_interval = std::env::var("BAN_SYNC_INTERVAL")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30);
+        Self {
+            list_file,
+            sync_url,
+            sync_interval,
+        }
+    }
+}
 
-        let trusted_proxy_cidrs = juiceutils::proxy::parse_trusted_proxy_cidrs(
-            &std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default(),
-        )?;
-
-        let max_range_response_mb = bounded_env("MAX_RANGE_RESPONSE_MB", 16u64, 1, 1024)?;
-        let max_range_response_bytes = max_range_response_mb * 1024 * 1024;
-        let max_concurrent_uploads = bounded_env("MAX_CONCURRENT_UPLOADS", 16usize, 1, 4096)?;
-        let max_concurrent_downloads = bounded_env("MAX_CONCURRENT_DOWNLOADS", 64usize, 1, 4096)?;
-        let max_concat_parts = bounded_env("MAX_CONCAT_PARTS", 128usize, 1, 4096)?;
-        let tcp_body_inactivity_seconds =
-            bounded_env("TCP_BODY_INACTIVITY_SECONDS", 30u64, 1, 3600)?;
-        let tcp_request_total_seconds =
-            bounded_env("TCP_REQUEST_TOTAL_SECONDS", 600u64, 1, 86_400)?;
-        let tcp_max_concurrent_requests =
-            bounded_env("TCP_MAX_CONCURRENT_REQUESTS", 512usize, 1, 65_536)?;
-        let quic_max_connections = bounded_env("QUIC_MAX_CONNECTIONS", 256usize, 1, 65_536)?;
-        let quic_max_requests = bounded_env("QUIC_MAX_REQUESTS", 256usize, 1, 65_536)?;
-        let quic_handshake_seconds = bounded_env("QUIC_HANDSHAKE_SECONDS", 10u64, 1, 120)?;
-        let quic_idle_seconds = bounded_env("QUIC_IDLE_SECONDS", 30u64, 1, 600)?;
-        let quic_request_total_seconds =
-            bounded_env("QUIC_REQUEST_TOTAL_SECONDS", 600u64, 1, 86_400)?;
+impl Config {
+    /// Load configuration from environment variables.
+    pub fn from_env() -> Result<Self, String> {
+        let public = PublicSettings::from_env()?;
+        let quic = QuicSettings::from_env(&public)?;
+        let threads = ThreadSettings::from_env()?;
+        let directories = DirectorySettings::from_env();
+        let security = SecuritySettings::from_env(&directories)?;
+        let s3 = S3Settings::from_env()?;
+        let limits = LimitsSettings::from_env()?;
+        let features = FeatureSettings::from_env()?;
+        let secrets = SecretSettings::from_env(&security);
+        let ban = BanSettings::from_env();
 
         Ok(Self {
-            public_host,
-            public_port,
-            quic_host,
-            quic_port,
-            worker_threads,
-            files_dir,
-            backend_url,
-            frontend_url,
-            api_key,
-            allowed_origins,
-            min_free_space_bytes,
-            s3_bucket,
-            s3_region,
-            s3_endpoint,
-            s3_allow_http,
-            s3_access_key,
-            s3_secret_key,
-            max_file_size_bytes,
-            quick_link,
-            custom_id,
-            danger_level,
-            quic_cert_path,
-            default_ttl_hours,
-            allowed_ttl_hours,
-            ticket_jwt_secret,
-            ip_pepper,
-            ban_list_file,
-            ban_sync_url,
-            ban_sync_interval,
-            trusted_proxy_cidrs,
-            max_range_response_bytes,
-            max_concurrent_uploads,
-            max_concurrent_downloads,
-            max_concat_parts,
-            tcp_body_inactivity_seconds,
-            tcp_request_total_seconds,
-            tcp_max_concurrent_requests,
-            quic_max_connections,
-            quic_max_requests,
-            quic_handshake_seconds,
-            quic_idle_seconds,
-            quic_request_total_seconds,
+            public_host: public.host,
+            public_port: public.port,
+            quic_host: quic.host,
+            quic_port: quic.port,
+            quic_cert_path: Some(quic.cert_path),
+            quic_max_connections: quic.max_connections,
+            quic_max_requests: quic.max_requests,
+            quic_handshake_seconds: quic.handshake_seconds,
+            quic_idle_seconds: quic.idle_seconds,
+            quic_request_total_seconds: quic.request_total_seconds,
+            worker_threads: threads.worker_threads,
+            files_dir: directories.files_dir,
+            backend_url: directories.backend_url,
+            frontend_url: directories.frontend_url,
+            api_key: security.api_key,
+            allowed_origins: security.allowed_origins,
+            danger_level: security.danger_level,
+            trusted_proxy_cidrs: security.trusted_proxy_cidrs,
+            s3_bucket: s3.bucket,
+            s3_region: s3.region,
+            s3_endpoint: s3.endpoint,
+            s3_allow_http: s3.allow_http,
+            s3_access_key: s3.access_key,
+            s3_secret_key: s3.secret_key,
+            min_free_space_bytes: limits.min_free_space_bytes,
+            max_file_size_bytes: limits.max_file_size_bytes,
+            max_range_response_bytes: limits.max_range_response_bytes,
+            max_concurrent_uploads: limits.max_concurrent_uploads,
+            max_concurrent_downloads: limits.max_concurrent_downloads,
+            max_concat_parts: limits.max_concat_parts,
+            tcp_body_inactivity_seconds: limits.tcp_body_inactivity_seconds,
+            tcp_request_total_seconds: limits.tcp_request_total_seconds,
+            tcp_max_concurrent_requests: limits.tcp_max_concurrent_requests,
+            quick_link: features.quick_link,
+            custom_id: features.custom_id,
+            default_ttl_hours: features.default_ttl_hours,
+            allowed_ttl_hours: features.allowed_ttl_hours,
+            ticket_jwt_secret: secrets.ticket_jwt_secret,
+            ip_pepper: secrets.ip_pepper,
+            ban_list_file: ban.list_file,
+            ban_sync_url: ban.sync_url,
+            ban_sync_interval: ban.sync_interval,
         })
     }
     pub fn is_s3_mode(&self) -> bool {
         self.s3_bucket.is_some()
-    }
-}
-
-fn env_bool(name: &str, default: bool) -> Result<bool, String> {
-    match std::env::var(name) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" => Ok(true),
-            "0" | "false" => Ok(false),
-            _ => Err(format!("{name} must be true, false, 1, or 0")),
-        },
-        Err(_) => Ok(default),
     }
 }
 
