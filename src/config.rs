@@ -4,6 +4,27 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigPort {
+    Public,
+    Quic,
+}
+
+impl ConfigPort {
+    pub fn env_var(self) -> &'static str {
+        match self {
+            ConfigPort::Public => "PUBLIC_PORT",
+            ConfigPort::Quic => "QUIC_PORT",
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.env_var())
+    }
+}
+
 /// Errors that could happen while loading environment configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -15,8 +36,8 @@ pub enum ConfigError {
         min: String,
         max: String,
     },
-    #[error("{name} must be a valid port")]
-    InvalidPort { name: &'static str },
+    #[error("{port} must be a valid port")]
+    InvalidPort { port: ConfigPort },
     #[error("QUIC_PORT must be set when PUBLIC_PORT is 65535")]
     MissingQuicPort,
     #[error("{name} must be true, false, 1, or 0")]
@@ -29,6 +50,14 @@ pub enum ConfigError {
     InvalidTtlConfiguration,
     #[error("{0}")]
     InvalidTrustedProxyCidrs(String),
+}
+
+impl ConfigError {
+    pub fn invalid_quic_port() -> Self {
+        ConfigError::InvalidPort {
+            port: ConfigPort::Quic,
+        }
+    }
 }
 
 /// Holds every setting juicehost needs to run.
@@ -118,7 +147,7 @@ impl Config {
             .ok()
             .map(|p| {
                 p.parse::<u16>().map_err(|_| ConfigError::InvalidPort {
-                    name: "PUBLIC_PORT",
+                    port: ConfigPort::Public,
                 })
             })
             .transpose()?
@@ -128,7 +157,7 @@ impl Config {
             .ok()
             .map(|p| {
                 p.parse::<u16>()
-                    .map_err(|_| ConfigError::InvalidPort { name: "QUIC_PORT" })
+                    .map_err(|_| ConfigError::invalid_quic_port())
             })
             .transpose()?
             .unwrap_or(
