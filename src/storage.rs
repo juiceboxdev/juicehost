@@ -116,14 +116,16 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
-    pub fn new(files_dir: PathBuf, min_free_space_bytes: u64) -> Result<Self, String> {
-        let files_dir = std::fs::canonicalize(&files_dir)
-            .map_err(|e| format!("canonicalize files directory failed: {e}"))?;
+    pub fn new(files_dir: PathBuf, min_free_space_bytes: u64) -> Result<Self, std::io::Error> {
+        let files_dir = std::fs::canonicalize(&files_dir)?;
         if !std::fs::metadata(&files_dir)
             .map(|m| m.is_dir())
             .unwrap_or(false)
         {
-            return Err("files directory is not a directory".into());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "files directory is not a directory",
+            ));
         }
         Ok(Self {
             files_dir,
@@ -134,33 +136,38 @@ impl LocalBackend {
     }
 
     /// Scan the files directory and populate the extension cache.
-    pub async fn init_cache(&self) -> Result<(), String> {
-        let mut entries = tokio::fs::read_dir(&self.files_dir)
-            .await
-            .map_err(|e| format!("read files directory failed: {e}"))?;
-        while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+    pub async fn init_cache(&self) -> Result<(), std::io::Error> {
+        let mut entries = tokio::fs::read_dir(&self.files_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with('.') && (name.ends_with(".reserve") || name.ends_with(".tmp")) {
-                let file_type = entry.file_type().await.map_err(|e| e.to_string())?;
+                let file_type = entry.file_type().await?;
                 if file_type.is_file() {
-                    tokio::fs::remove_file(entry.path())
-                        .await
-                        .map_err(|e| format!("remove stale storage file {name}: {e}"))?;
+                    tokio::fs::remove_file(entry.path()).await?;
                 }
                 continue;
             }
-            let file_type = entry.file_type().await.map_err(|e| e.to_string())?;
+            let file_type = entry.file_type().await?;
             if file_type.is_symlink() || !file_type.is_file() {
-                return Err(format!("storage entry is not a regular file: {name}"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("storage entry is not a regular file: {name}"),
+                ));
             }
             if let Some(dot) = name.rfind('.') {
                 let id = name[..dot].to_string();
                 let ext = name[dot + 1..].to_string();
                 if !valid_component(&id) || !valid_component(&ext) {
-                    return Err(format!("invalid storage entry name: {name}"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid storage entry name: {name}"),
+                    ));
                 }
                 if self.extensions.insert(id.clone(), ext).is_some() {
-                    return Err(format!("duplicate logical file ID: {id}"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("duplicate logical file ID: {id}"),
+                    ));
                 }
             }
         }

@@ -2,6 +2,35 @@
 
 use std::path::PathBuf;
 
+use thiserror::Error;
+
+/// Errors raised while loading environment configuration.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("{name} must be a number")]
+    InvalidNumber { name: &'static str },
+    #[error("{name} must be between {min} and {max}")]
+    OutOfRange {
+        name: &'static str,
+        min: String,
+        max: String,
+    },
+    #[error("{name} must be a valid port")]
+    InvalidPort { name: &'static str },
+    #[error("QUIC_PORT must be set when PUBLIC_PORT is 65535")]
+    MissingQuicPort,
+    #[error("{name} must be true, false, 1, or 0")]
+    InvalidBoolean { name: &'static str },
+    #[error("ALLOWED_TTL_HOURS contains an invalid number")]
+    InvalidAllowedTtl,
+    #[error("DEFAULT_TTL_HOURS must be a number")]
+    InvalidDefaultTtl,
+    #[error("TTL values must be finite, positive, and include DEFAULT_TTL_HOURS")]
+    InvalidTtlConfiguration,
+    #[error("{0}")]
+    InvalidTrustedProxyCidrs(String),
+}
+
 /// Holds every setting juicehost needs to run.
 // If any missing in .env.example, tell me.
 #[derive(Debug, Clone)]
@@ -61,31 +90,36 @@ pub struct Config {
     pub ban_sync_interval: u64,
 }
 
-fn bounded_env<T>(name: &str, default: T, min: T, max: T) -> Result<T, String>
+fn bounded_env<T>(name: &'static str, default: T, min: T, max: T) -> Result<T, ConfigError>
 where
     T: std::str::FromStr + PartialOrd + Copy + std::fmt::Display,
 {
     let value = match std::env::var(name) {
         Ok(raw) => raw
             .parse::<T>()
-            .map_err(|_| format!("{name} must be a number"))?,
+            .map_err(|_| ConfigError::InvalidNumber { name })?,
         Err(_) => default,
     };
     if value < min || value > max {
-        return Err(format!("{name} must be between {min} and {max}"));
+        return Err(ConfigError::OutOfRange {
+            name,
+            min: min.to_string(),
+            max: max.to_string(),
+        });
     }
     Ok(value)
 }
 
 impl Config {
     /// Load configuration from environment variables.
-    pub fn from_env() -> Result<Self, String> {
+    pub fn from_env() -> Result<Self, ConfigError> {
         let public_host = std::env::var("PUBLIC_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let public_port = std::env::var("PUBLIC_PORT")
             .ok()
             .map(|p| {
-                p.parse::<u16>()
-                    .map_err(|_| "PUBLIC_PORT must be a valid port")
+                p.parse::<u16>().map_err(|_| ConfigError::InvalidPort {
+                    name: "PUBLIC_PORT",
+                })
             })
             .transpose()?
             .unwrap_or(6402);
@@ -94,13 +128,13 @@ impl Config {
             .ok()
             .map(|p| {
                 p.parse::<u16>()
-                    .map_err(|_| "QUIC_PORT must be a valid port")
+                    .map_err(|_| ConfigError::InvalidPort { name: "QUIC_PORT" })
             })
             .transpose()?
             .unwrap_or(
                 public_port
                     .checked_add(1)
-                    .ok_or("QUIC_PORT must be set when PUBLIC_PORT is 65535")?,
+                    .ok_or(ConfigError::MissingQuicPort)?,
             );
         let worker_threads = bounded_env("WORKER_THREADS", 3usize, 1, 256)?;
         let files_dir = std::env::var("FILES_DIR")
@@ -181,16 +215,13 @@ impl Config {
             .map(|s| {
                 s.trim()
                     .parse::<f64>()
-                    .map_err(|_| "ALLOWED_TTL_HOURS contains an invalid number")
+                    .map_err(|_| ConfigError::InvalidAllowedTtl)
             })
             .collect::<Result<_, _>>()?;
 
         let default_ttl_hours = std::env::var("DEFAULT_TTL_HOURS")
             .ok()
-            .map(|v| {
-                v.parse::<f64>()
-                    .map_err(|_| "DEFAULT_TTL_HOURS must be a number")
-            })
+            .map(|v| v.parse::<f64>().map_err(|_| ConfigError::InvalidDefaultTtl))
             .transpose()?
             .unwrap_or(24.0);
 
@@ -202,9 +233,7 @@ impl Config {
             || default_ttl_hours <= 0.0
             || !allowed_ttl_hours.contains(&default_ttl_hours)
         {
-            return Err(
-                "TTL values must be finite, positive, and include DEFAULT_TTL_HOURS".into(),
-            );
+            return Err(ConfigError::InvalidTtlConfiguration);
         }
 
         let ticket_jwt_secret = std::env::var("TICKET_JWT_SECRET")
@@ -229,7 +258,8 @@ impl Config {
 
         let trusted_proxy_cidrs = juiceutils::proxy::parse_trusted_proxy_cidrs(
             &std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default(),
-        )?;
+        )
+        .map_err(ConfigError::InvalidTrustedProxyCidrs)?;
 
         let max_range_response_mb = bounded_env("MAX_RANGE_RESPONSE_MB", 16u64, 1, 1024)?;
         let max_range_response_bytes = max_range_response_mb * 1024 * 1024;
@@ -299,12 +329,12 @@ impl Config {
     }
 }
 
-fn env_bool(name: &str, default: bool) -> Result<bool, String> {
+fn env_bool(name: &'static str, default: bool) -> Result<bool, ConfigError> {
     match std::env::var(name) {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
             "1" | "true" => Ok(true),
             "0" | "false" => Ok(false),
-            _ => Err(format!("{name} must be true, false, 1, or 0")),
+            _ => Err(ConfigError::InvalidBoolean { name }),
         },
         Err(_) => Ok(default),
     }
