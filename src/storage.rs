@@ -707,7 +707,7 @@ impl S3Backend {
         access_key: &str,
         secret_key: &str,
         allow_http: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, StorageError> {
         let mut builder = object_store::aws::AmazonS3Builder::new()
             .with_bucket_name(bucket)
             .with_region(region)
@@ -717,15 +717,15 @@ impl S3Backend {
 
         if let Some(ep) = endpoint {
             if ep.starts_with("http://") && !allow_http {
-                return Err("S3_ENDPOINT uses HTTP; set S3_ALLOW_HTTP=true to allow it".into());
+                return Err(StorageError::Io(
+                    "S3_ENDPOINT uses HTTP; set S3_ALLOW_HTTP=true to allow it".into(),
+                ));
             }
             builder = builder.with_endpoint(ep);
             builder = builder.with_allow_http(allow_http);
         }
 
-        let client = builder
-            .build()
-            .map_err(|e| format!("S3 client build failed: {}", e))?;
+        let client = builder.build()?;
 
         Ok(Self {
             client: Arc::new(client),
@@ -765,8 +765,7 @@ impl S3Backend {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(map_object_store_error)?;
+            .await?;
         match self.stat(id).await {
             Ok(_) => {
                 let _ = self.client.delete(&reservation).await;
@@ -797,8 +796,7 @@ impl StorageBackend for S3Backend {
 
         let payload = object_store::PutPayload::from(data);
 
-        let result = self
-            .client
+        self.client
             .put_opts(
                 &path,
                 payload,
@@ -807,10 +805,9 @@ impl StorageBackend for S3Backend {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(map_object_store_error);
+            .await?;
         self.release_id(&reservation).await;
-        result.map(|_| ())
+        Ok(())
     }
 
     async fn put_stream(
@@ -865,16 +862,11 @@ impl StorageBackend for S3Backend {
             self.release_id(&reservation).await;
             return Err(StorageError::Io(format!("S3 upload failed: {e}")));
         }
-        let publish = self
-            .client
-            .copy_if_not_exists(&temp_path, &path)
-            .await
-            .map_err(map_object_store_error);
+        self.client.copy_if_not_exists(&temp_path, &path).await?;
         if let Err(e) = self.client.delete(&temp_path).await {
             tracing::warn!("failed to remove S3 temp object {}: {}", temp_path, e);
         }
         self.release_id(&reservation).await;
-        publish?;
         Ok(total)
     }
 
@@ -948,13 +940,8 @@ impl StorageBackend for S3Backend {
         let source = Self::object_key(old_id, &meta.extension);
         let target = Self::object_key(new_id, &meta.extension);
         let reservation = self.reserve_id(new_id).await?;
-        let result = self
-            .client
-            .copy_if_not_exists(&source, &target)
-            .await
-            .map_err(map_object_store_error);
+        self.client.copy_if_not_exists(&source, &target).await?;
         self.release_id(&reservation).await;
-        result?;
         self.delete(old_id).await?;
         Ok(())
     }
@@ -1118,14 +1105,11 @@ impl StorageBackend for S3Backend {
             self.release_id(&reservation).await;
             return Err(StorageError::Io(format!("S3 concat upload failed: {e}")));
         }
-        let publish = self
-            .client
+        self.client
             .copy_if_not_exists(&temp_path, &target_path)
-            .await
-            .map_err(map_object_store_error);
+            .await?;
         let _ = self.client.delete(&temp_path).await;
         self.release_id(&reservation).await;
-        publish?;
 
         for part_id in part_ids {
             if let Err(e) = self.delete(part_id).await {
@@ -1137,12 +1121,13 @@ impl StorageBackend for S3Backend {
     }
 }
 
-fn map_object_store_error(error: object_store::Error) -> StorageError {
-    match error {
-        object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. } => {
-            StorageError::Conflict
+impl From<object_store::Error> for StorageError {
+    fn from(error: object_store::Error) -> Self {
+        match error {
+            object_store::Error::AlreadyExists { .. }
+            | object_store::Error::Precondition { .. } => StorageError::Conflict,
+            error => StorageError::Io(error.to_string()),
         }
-        error => StorageError::Io(error.to_string()),
     }
 }
 
