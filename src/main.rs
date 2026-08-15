@@ -15,6 +15,7 @@ use juicehost::storage::{LocalBackend, S3Backend, StorageBackend};
 #[cfg(feature = "quic")]
 use tokio::sync::Notify;
 
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
