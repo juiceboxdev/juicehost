@@ -116,14 +116,16 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
-    pub fn new(files_dir: PathBuf, min_free_space_bytes: u64) -> Result<Self, String> {
-        let files_dir = std::fs::canonicalize(&files_dir)
-            .map_err(|e| format!("canonicalize files directory failed: {e}"))?;
+    pub fn new(files_dir: PathBuf, min_free_space_bytes: u64) -> Result<Self, std::io::Error> {
+        let files_dir = std::fs::canonicalize(&files_dir)?;
         if !std::fs::metadata(&files_dir)
             .map(|m| m.is_dir())
             .unwrap_or(false)
         {
-            return Err("files directory is not a directory".into());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "files directory is not a directory",
+            ));
         }
         Ok(Self {
             files_dir,
@@ -134,33 +136,38 @@ impl LocalBackend {
     }
 
     /// Scan the files directory and populate the extension cache.
-    pub async fn init_cache(&self) -> Result<(), String> {
-        let mut entries = tokio::fs::read_dir(&self.files_dir)
-            .await
-            .map_err(|e| format!("read files directory failed: {e}"))?;
-        while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+    pub async fn init_cache(&self) -> Result<(), std::io::Error> {
+        let mut entries = tokio::fs::read_dir(&self.files_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with('.') && (name.ends_with(".reserve") || name.ends_with(".tmp")) {
-                let file_type = entry.file_type().await.map_err(|e| e.to_string())?;
+                let file_type = entry.file_type().await?;
                 if file_type.is_file() {
-                    tokio::fs::remove_file(entry.path())
-                        .await
-                        .map_err(|e| format!("remove stale storage file {name}: {e}"))?;
+                    tokio::fs::remove_file(entry.path()).await?;
                 }
                 continue;
             }
-            let file_type = entry.file_type().await.map_err(|e| e.to_string())?;
+            let file_type = entry.file_type().await?;
             if file_type.is_symlink() || !file_type.is_file() {
-                return Err(format!("storage entry is not a regular file: {name}"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("storage entry is not a regular file: {name}"),
+                ));
             }
             if let Some(dot) = name.rfind('.') {
                 let id = name[..dot].to_string();
                 let ext = name[dot + 1..].to_string();
                 if !valid_component(&id) || !valid_component(&ext) {
-                    return Err(format!("invalid storage entry name: {name}"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid storage entry name: {name}"),
+                    ));
                 }
                 if self.extensions.insert(id.clone(), ext).is_some() {
-                    return Err(format!("duplicate logical file ID: {id}"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("duplicate logical file ID: {id}"),
+                    ));
                 }
             }
         }
@@ -700,7 +707,7 @@ impl S3Backend {
         access_key: &str,
         secret_key: &str,
         allow_http: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, StorageError> {
         let mut builder = object_store::aws::AmazonS3Builder::new()
             .with_bucket_name(bucket)
             .with_region(region)
@@ -710,15 +717,15 @@ impl S3Backend {
 
         if let Some(ep) = endpoint {
             if ep.starts_with("http://") && !allow_http {
-                return Err("S3_ENDPOINT uses HTTP; set S3_ALLOW_HTTP=true to allow it".into());
+                return Err(StorageError::Io(
+                    "S3_ENDPOINT uses HTTP; set S3_ALLOW_HTTP=true to allow it".into(),
+                ));
             }
             builder = builder.with_endpoint(ep);
             builder = builder.with_allow_http(allow_http);
         }
 
-        let client = builder
-            .build()
-            .map_err(|e| format!("S3 client build failed: {}", e))?;
+        let client = builder.build()?;
 
         Ok(Self {
             client: Arc::new(client),
@@ -758,8 +765,7 @@ impl S3Backend {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(map_object_store_error)?;
+            .await?;
         match self.stat(id).await {
             Ok(_) => {
                 let _ = self.client.delete(&reservation).await;
@@ -790,8 +796,7 @@ impl StorageBackend for S3Backend {
 
         let payload = object_store::PutPayload::from(data);
 
-        let result = self
-            .client
+        self.client
             .put_opts(
                 &path,
                 payload,
@@ -800,10 +805,9 @@ impl StorageBackend for S3Backend {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(map_object_store_error);
+            .await?;
         self.release_id(&reservation).await;
-        result.map(|_| ())
+        Ok(())
     }
 
     async fn put_stream(
@@ -858,16 +862,11 @@ impl StorageBackend for S3Backend {
             self.release_id(&reservation).await;
             return Err(StorageError::Io(format!("S3 upload failed: {e}")));
         }
-        let publish = self
-            .client
-            .copy_if_not_exists(&temp_path, &path)
-            .await
-            .map_err(map_object_store_error);
+        self.client.copy_if_not_exists(&temp_path, &path).await?;
         if let Err(e) = self.client.delete(&temp_path).await {
             tracing::warn!("failed to remove S3 temp object {}: {}", temp_path, e);
         }
         self.release_id(&reservation).await;
-        publish?;
         Ok(total)
     }
 
@@ -941,13 +940,8 @@ impl StorageBackend for S3Backend {
         let source = Self::object_key(old_id, &meta.extension);
         let target = Self::object_key(new_id, &meta.extension);
         let reservation = self.reserve_id(new_id).await?;
-        let result = self
-            .client
-            .copy_if_not_exists(&source, &target)
-            .await
-            .map_err(map_object_store_error);
+        self.client.copy_if_not_exists(&source, &target).await?;
         self.release_id(&reservation).await;
-        result?;
         self.delete(old_id).await?;
         Ok(())
     }
@@ -1111,14 +1105,11 @@ impl StorageBackend for S3Backend {
             self.release_id(&reservation).await;
             return Err(StorageError::Io(format!("S3 concat upload failed: {e}")));
         }
-        let publish = self
-            .client
+        self.client
             .copy_if_not_exists(&temp_path, &target_path)
-            .await
-            .map_err(map_object_store_error);
+            .await?;
         let _ = self.client.delete(&temp_path).await;
         self.release_id(&reservation).await;
-        publish?;
 
         for part_id in part_ids {
             if let Err(e) = self.delete(part_id).await {
@@ -1130,12 +1121,13 @@ impl StorageBackend for S3Backend {
     }
 }
 
-fn map_object_store_error(error: object_store::Error) -> StorageError {
-    match error {
-        object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. } => {
-            StorageError::Conflict
+impl From<object_store::Error> for StorageError {
+    fn from(error: object_store::Error) -> Self {
+        match error {
+            object_store::Error::AlreadyExists { .. }
+            | object_store::Error::Precondition { .. } => StorageError::Conflict,
+            error => StorageError::Io(error.to_string()),
         }
-        error => StorageError::Io(error.to_string()),
     }
 }
 

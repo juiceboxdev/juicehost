@@ -6,6 +6,7 @@ use axum::{
     Json,
 };
 use serde::Serialize;
+use thiserror::Error;
 use utoipa::ToSchema;
 
 const NOT_FOUND_HTML_TEMPLATE: &str = include_str!("templates/not_found.html");
@@ -21,36 +22,27 @@ pub struct ErrorResponse {
 }
 
 /// Errors returned by storage backends.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum StorageError {
     /// The requested file does not exist.
+    #[error("file not found")]
     NotFound,
     /// The target file already exists (conflict on create/rename).
+    #[error("conflict: file already exists")]
     Conflict,
     /// The uploaded file exceeds the size limit.
+    #[error("payload too large")]
     PayloadTooLarge,
     /// A stream ended at a size other than its required exact length.
+    #[error("payload size mismatch")]
     SizeMismatch,
     /// The storage backend has run out of space.
+    #[error("insufficient storage")]
     InsufficientStorage,
     /// An I/O or backend-specific error occurred.
+    #[error("{0}")]
     Io(String),
 }
-
-impl std::fmt::Display for StorageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StorageError::NotFound => write!(f, "file not found"),
-            StorageError::Conflict => write!(f, "conflict: file already exists"),
-            StorageError::PayloadTooLarge => write!(f, "payload too large"),
-            StorageError::SizeMismatch => write!(f, "payload size mismatch"),
-            StorageError::InsufficientStorage => write!(f, "insufficient storage"),
-            StorageError::Io(msg) => write!(f, "{}", msg),
-        }
-    }
-}
-
-impl std::error::Error for StorageError {}
 
 impl From<StorageError> for JuicehostError {
     fn from(e: StorageError) -> Self {
@@ -112,27 +104,37 @@ fn escape_html(value: &str) -> String {
 }
 
 /// Errors that could maybe occur during request handling.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum JuicehostError {
     /// The requested file does not exist.
+    #[error("file not found")]
     NotFound,
     /// The request was malformed or missing required fields.
+    #[error("bad request")]
     BadRequest,
     /// The target file already exists (conflict on create/rename).
+    #[error("target file already exists")]
     Conflict,
     /// The uploaded file exceeds the size limit.
+    #[error("file too large")]
     PayloadTooLarge,
     /// The storage backend has run out of space.
+    #[error("insufficient storage")]
     InsufficientStorage,
     /// An unexpected internal error occurred.
+    #[error("internal server error")]
     InternalServerError,
     /// The request lacked valid authentication credentials.
+    #[error("forbidden")]
     Forbidden,
     /// The uploaded file type was blocked by validation (dangerous extension or magic bytes).
+    #[error("{0}")]
     BlockedFileType(String),
     /// A declared or signed request size did not match the body.
+    #[error("request body size does not match the signed file size")]
     SizeMismatch,
     /// A configured concurrency limit is currently exhausted.
+    #[error("server concurrency limit reached")]
     ServiceUnavailable,
 }
 
