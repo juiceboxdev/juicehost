@@ -52,6 +52,8 @@ pub struct AppState {
     pub tcp_request_total: std::time::Duration,
     pub upload_semaphore: Arc<tokio::sync::Semaphore>,
     pub download_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Reused client for bounded juiceback status, alias, and health probes.
+    pub backend_client: reqwest::Client,
 }
 
 impl AppState {
@@ -84,6 +86,10 @@ impl AppState {
             download_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.max_concurrent_downloads,
             )),
+            backend_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("fixed backend HTTP client configuration must be valid"),
         }
     }
 }

@@ -17,16 +17,16 @@ quic = [
 ]
 
 [dependencies]
-axum = { version = "0.7", features = ["multipart", "ws"] }
+axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.4", features = ["limit", "util"] }
-tower-http = { version = "0.5", features = ["fs", "trace", "compression-gzip", "compression-br", "compression-zstd", "limit", "cors", "timeout"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "timeout"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mimalloc = { version = "0.1", optional = true }
 thiserror = "2.0.20"
 dotenvy = "0.15"
-reqwest = { version = "0.12", features = ["multipart", "stream", "json"] }
+reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -47,4 +47,3 @@ juiceutils = { path = "juiceutils" }
 
 [dev-dependencies]
 tempfile = "3"
-tower = { version = "0.4", features = ["util"] }
