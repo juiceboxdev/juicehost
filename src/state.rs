@@ -35,6 +35,8 @@ pub struct AppState {
     pub quick_link: bool,
     /// Custom file ID slugs enabled.
     pub custom_id: bool,
+    pub file_cache_enabled: bool,
+    pub file_cache_max_age_secs: u64,
     /// JWT signing secret for validating upload tickets.
     pub ticket_jwt_secret: String,
     /// Optional IP ban list shared with the middleware.
@@ -72,6 +74,8 @@ impl AppState {
             allowed_ttl_hours: config.allowed_ttl_hours.clone(),
             quick_link: config.quick_link,
             custom_id: config.custom_id,
+            file_cache_enabled: config.file_cache_enabled,
+            file_cache_max_age_secs: config.file_cache_max_age_secs,
             ticket_jwt_secret: config.ticket_jwt_secret.clone(),
             ban_list: Arc::new(juiceutils::ban::BanList::new(config.ip_pepper.clone())),
             ban_list_file: config.ban_list_file.clone(),

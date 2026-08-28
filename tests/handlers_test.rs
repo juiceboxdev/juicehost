@@ -47,6 +47,8 @@ fn test_config(ticket_secret: &str, frontend_url: Option<String>) -> Config {
         tcp_max_concurrent_requests: 512,
         quick_link: false,
         custom_id: false,
+        file_cache_enabled: false,
+        file_cache_max_age_secs: 3600,
         default_ttl_hours: 24.0,
         allowed_ttl_hours: vec![1.0, 24.0, 168.0],
         ticket_jwt_secret: ticket_secret.into(),

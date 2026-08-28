@@ -110,6 +110,8 @@ pub struct Config {
     pub custom_id: bool,
     pub default_ttl_hours: f64,
     pub allowed_ttl_hours: Vec<f64>,
+    pub file_cache_enabled: bool,
+    pub file_cache_max_age_secs: u64,
     /// Secrets
     pub ticket_jwt_secret: String,
     pub ip_pepper: String,
@@ -226,6 +228,9 @@ impl Config {
         let quick_link = env_bool("QUICK_LINK", true)?;
         let custom_id = env_bool("CUSTOM_ID", true)?;
 
+        let file_cache_enabled = env_bool("FILE_CACHE_ENABLED", false)?;
+        let file_cache_max_age_secs = bounded_env("FILE_CACHE_MAX_AGE_SECS", 3600u64, 1, 86_400)?;
+
         let danger_level = juiceutils::file_validation::ProtectionLevel::parse(
             &std::env::var("DANGER_LEVEL").unwrap_or_else(|_| "high".to_string()),
         );
@@ -329,6 +334,8 @@ impl Config {
             max_file_size_bytes,
             quick_link,
             custom_id,
+            file_cache_enabled,
+            file_cache_max_age_secs,
             danger_level,
             quic_cert_path,
             default_ttl_hours,

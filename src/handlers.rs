@@ -61,6 +61,38 @@ fn required_file_capability(
 /// Perhaps making this configurable using config?
 const FILE_CACHE_CONTROL: &str = "no-store";
 
+fn file_cache_control_value(state: &AppState, ttl_remaining_secs: Option<u64>) -> String {
+    if !state.file_cache_enabled {
+        return FILE_CACHE_CONTROL.to_string();
+    }
+    match ttl_remaining_secs {
+        Some(secs) if secs > 0 => {
+            let age = secs.min(state.file_cache_max_age_secs);
+            format!("public, max-age={age}, s-maxage={age}")
+        }
+        _ => FILE_CACHE_CONTROL.to_string(),
+    }
+}
+
+async fn remaining_ttl_secs(state: &AppState, id: &str) -> Option<u64> {
+    if !state.file_cache_enabled {
+        return None;
+    }
+    let backend_url = state.backend_url.as_ref()?;
+    let status_url = format!("{}/internal/file/{}/status", backend_url, id);
+    let resp = backend_request(state, status_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.json::<serde_json::Value>().await.ok()?;
+    let expires_at = body.get("expires_at")?.as_i64()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some((expires_at - now).max(0) as u64)
+}
+
 /// Header sent on peer health probes. The receiving side skips probing back so
 /// juiceback and juicehost don't recurse into each other's /api/health forever.
 //                                                            ^ yes this happened.
@@ -179,15 +211,32 @@ async fn serve_file_inner(
 
     let etag = &file_meta.etag;
 
+    let ttl_remaining = remaining_ttl_secs(&state, &id).await;
+    let cache_control = file_cache_control_value(&state, ttl_remaining);
+    let cache_tag = if cache_control == FILE_CACHE_CONTROL {
+        None
+    } else {
+        Some(format!("juicebox:{id}"))
+    };
+    let with_cache_headers = |mut builder: axum::http::response::Builder| {
+        builder = builder.header(header::CACHE_CONTROL, &cache_control);
+        if let Some(tag) = &cache_tag {
+            builder = builder
+                .header(header::HeaderName::from_static("cache-tag"), tag);
+        }
+        builder
+    };
+
     if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH) {
         if let Ok(val) = if_none_match.to_str() {
             if val.trim_matches('"') == etag.trim_matches('"') {
-                return Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(header::CACHE_CONTROL, FILE_CACHE_CONTROL)
-                    .header(header::ETAG, etag)
-                    .body(Body::empty())
-                    .map_err(|_| JuicehostError::InternalServerError);
+                return with_cache_headers(
+                    Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .header(header::ETAG, etag),
+                )
+                .body(Body::empty())
+                .map_err(|_| JuicehostError::InternalServerError);
             }
         }
     }
@@ -212,28 +261,30 @@ async fn serve_file_inner(
                         let _ = &permit;
                         item
                     });
-                    return Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header(header::CONTENT_TYPE, &mime_str)
-                        .header(header::CONTENT_LENGTH, content_len)
-                        .header(
-                            header::CONTENT_RANGE,
-                            format!("bytes {}-{}/{}", start, end, total_size),
-                        )
-                        .header(header::CACHE_CONTROL, FILE_CACHE_CONTROL)
-                        .header(header::ETAG, etag)
-                        .header(header::ACCEPT_RANGES, "bytes")
-                        .body(Body::from_stream(stream))
-                        .map_err(|_| JuicehostError::InternalServerError);
+                    return with_cache_headers(
+                        Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header(header::CONTENT_TYPE, &mime_str)
+                            .header(header::CONTENT_LENGTH, content_len)
+                            .header(
+                                header::CONTENT_RANGE,
+                                format!("bytes {}-{}/{}", start, end, total_size),
+                            )
+                            .header(header::ETAG, etag)
+                            .header(header::ACCEPT_RANGES, "bytes"),
+                    )
+                    .body(Body::from_stream(stream))
+                    .map_err(|_| JuicehostError::InternalServerError);
                 }
                 RangeResult::Unsatisfiable => {
-                    return Response::builder()
-                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                        .header(header::CONTENT_RANGE, format!("bytes */{total_size}"))
-                        .header(header::CACHE_CONTROL, FILE_CACHE_CONTROL)
-                        .header(header::ACCEPT_RANGES, "bytes")
-                        .body(Body::empty())
-                        .map_err(|_| JuicehostError::InternalServerError);
+                    return with_cache_headers(
+                        Response::builder()
+                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .header(header::CONTENT_RANGE, format!("bytes */{total_size}"))
+                            .header(header::ACCEPT_RANGES, "bytes"),
+                    )
+                    .body(Body::empty())
+                    .map_err(|_| JuicehostError::InternalServerError);
                 }
                 RangeResult::Ignore => {}
             }
@@ -251,15 +302,16 @@ async fn serve_file_inner(
     });
     let body = Body::from_stream(stream);
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, &mime_str)
-        .header(header::CONTENT_LENGTH, total_size)
-        .header(header::CACHE_CONTROL, FILE_CACHE_CONTROL)
-        .header(header::ETAG, etag)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .body(body)
-        .map_err(|_| JuicehostError::InternalServerError)
+    with_cache_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, &mime_str)
+            .header(header::CONTENT_LENGTH, total_size)
+            .header(header::ETAG, etag)
+            .header(header::ACCEPT_RANGES, "bytes"),
+    )
+    .body(body)
+    .map_err(|_| JuicehostError::InternalServerError)
 }
 
 /// Parse a `Range: bytes=START-END` header.
