@@ -43,7 +43,7 @@ async-trait = "0.1"
 utoipa = { version = "5", features = ["axum_extras"] }
 sentry = { version = "0.48", features = ["tower", "tower-axum-matched-path"] }
 sentry-tracing = "0.48"
-juiceutils = { path = "juiceutils" }
+juiceutils = { path = "juiceutils", package = "juicehost-juiceutils" }
 
 [dev-dependencies]
 tempfile = "3"
