@@ -57,6 +57,17 @@ fn main() {
 
     let config = Config::from_env().expect("Failed to load configuration");
 
+    // Refuse to boot an unauthenticated instance by accident. Internal
+    // endpoints can store, overwrite, and delete files - open-by-default
+    // is a footgun. Set JUICEHOST_API_KEY, or JUICEHOST_ALLOW_NO_AUTH=true
+    // to explicitly accept the risk (dev/loopback only).
+    if config.api_key.is_empty() && !config.allow_no_auth {
+        tracing::error!(
+            "JUICEHOST_API_KEY is not set - refusing to start with unauthenticated internal endpoints. Configure a key or set JUICEHOST_ALLOW_NO_AUTH=true to override."
+        );
+        std::process::exit(1);
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.worker_threads)
         .enable_all()

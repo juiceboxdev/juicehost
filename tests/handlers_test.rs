@@ -27,6 +27,7 @@ fn test_config(ticket_secret: &str, frontend_url: Option<String>) -> Config {
         backend_url: None,
         frontend_url,
         api_key: "test-api-key".into(),
+        allow_no_auth: false,
         allowed_origins: vec![],
         danger_level: juiceutils::file_validation::ProtectionLevel::High,
         trusted_proxy_cidrs: vec![],
@@ -47,6 +48,8 @@ fn test_config(ticket_secret: &str, frontend_url: Option<String>) -> Config {
         tcp_max_concurrent_requests: 512,
         quick_link: false,
         custom_id: false,
+        file_cache_enabled: false,
+        file_cache_max_age_secs: 3600,
         default_ttl_hours: 24.0,
         allowed_ttl_hours: vec![1.0, 24.0, 168.0],
         ticket_jwt_secret: ticket_secret.into(),
@@ -60,7 +63,11 @@ fn test_config(ticket_secret: &str, frontend_url: Option<String>) -> Config {
 async fn test_state(dir: &std::path::Path) -> Arc<AppState> {
     let backend = Arc::new(LocalBackend::new(dir.to_path_buf(), 0).unwrap());
     backend.init_cache().await.unwrap();
-    Arc::new(AppState::new(&test_config("", None), backend))
+    let mut cfg = test_config("", None);
+    // Handler-level fixtures exercise business logic; keep the legacy
+    // open-mode behavior here explicitly (auth has its own test below).
+    cfg.allow_no_auth = true;
+    Arc::new(AppState::new(&cfg, backend))
 }
 
 async fn frontend_state(dir: &std::path::Path) -> Arc<AppState> {
@@ -195,6 +202,7 @@ async fn serve_not_found() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
 }
 
 #[tokio::test]
@@ -249,6 +257,7 @@ async fn serve_etag_304() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
     let etag = resp.headers().get("etag").unwrap().clone();
 
     let app = test_state(dir.path()).await;
@@ -264,6 +273,7 @@ async fn serve_etag_304() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
 }
 
 #[tokio::test]
@@ -288,6 +298,7 @@ async fn ranges_clamp_and_return_416() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()["cache-control"], "no-store");
     assert_eq!(response.headers()["content-range"], "bytes 7-9/10");
     assert_eq!(
         axum::body::to_bytes(response.into_body(), 32)
@@ -308,6 +319,7 @@ async fn ranges_clamp_and_return_416() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(response.headers()["cache-control"], "no-store");
     assert_eq!(response.headers()["content-range"], "bytes */10");
 }
 
@@ -781,6 +793,9 @@ async fn internal_endpoints_open_when_no_api_key_configured() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config("", None);
     config.api_key = String::new();
+    // Open mode is now opt-in: an unset key alone refuses all internal
+    // traffic (see empty_api_key_fails_closed_without_explicit_opt_out).
+    config.allow_no_auth = true;
     let backend = Arc::new(LocalBackend::new(dir.path().to_path_buf(), 0).unwrap());
     backend.init_cache().await.unwrap();
     let app = build_router(Arc::new(AppState::new(&config, backend)));
@@ -1180,4 +1195,49 @@ async fn banned_ip_blocked_from_file_serving() {
         .await
         .unwrap();
     assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn empty_api_key_fails_closed_without_explicit_opt_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(LocalBackend::new(dir.path().to_path_buf(), 0).unwrap());
+    backend.init_cache().await.unwrap();
+
+    // No key, no explicit opt-out: internal endpoints must reject.
+    let mut cfg = test_config("", None);
+    cfg.api_key = String::new();
+    cfg.allow_no_auth = false;
+    let state = Arc::new(AppState::new(&cfg, backend.clone()));
+    let app = build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/file/someid/rename")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"new_id":"other"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Explicit JUICEHOST_ALLOW_NO_AUTH opt-out keeps legacy open uploads
+    // working (mutations like rename still demand per-file capabilities).
+    let mut cfg = test_config("", None);
+    cfg.api_key = String::new();
+    cfg.allow_no_auth = true;
+    let state = Arc::new(AppState::new(&cfg, backend));
+    let app = build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/file/stream/optout1/notes.txt")
+                .body(Body::from(b"open data".as_slice()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

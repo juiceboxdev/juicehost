@@ -15,6 +15,9 @@ pub struct AppState {
     pub storage: Arc<dyn StorageBackend>,
     /// Shared secret for authenticating internal API calls from juiceback.
     pub api_key: String,
+    /// When true, an empty `api_key` is an explicit opt-out and internal
+    /// endpoints stay open. When false (default), empty key = reject all.
+    pub allow_no_auth: bool,
     /// Allowed values for the `X-Juiceback-Origin` header. Empty means allow all.
     pub allowed_origins: Vec<String>,
     /// Minimum free disk space (bytes) before rejecting writes.
@@ -35,6 +38,8 @@ pub struct AppState {
     pub quick_link: bool,
     /// Custom file ID slugs enabled.
     pub custom_id: bool,
+    pub file_cache_enabled: bool,
+    pub file_cache_max_age_secs: u64,
     /// JWT signing secret for validating upload tickets.
     pub ticket_jwt_secret: String,
     /// Optional IP ban list shared with the middleware.
@@ -52,6 +57,8 @@ pub struct AppState {
     pub tcp_request_total: std::time::Duration,
     pub upload_semaphore: Arc<tokio::sync::Semaphore>,
     pub download_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Reused client for bounded juiceback status, alias, and health probes.
+    pub backend_client: reqwest::Client,
 }
 
 impl AppState {
@@ -60,6 +67,7 @@ impl AppState {
         Self {
             storage,
             api_key: config.api_key.clone(),
+            allow_no_auth: config.allow_no_auth,
             allowed_origins: config.allowed_origins.clone(),
             min_free_space_bytes: config.min_free_space_bytes,
             max_file_size_bytes: config.max_file_size_bytes,
@@ -70,6 +78,8 @@ impl AppState {
             allowed_ttl_hours: config.allowed_ttl_hours.clone(),
             quick_link: config.quick_link,
             custom_id: config.custom_id,
+            file_cache_enabled: config.file_cache_enabled,
+            file_cache_max_age_secs: config.file_cache_max_age_secs,
             ticket_jwt_secret: config.ticket_jwt_secret.clone(),
             ban_list: Arc::new(juiceutils::ban::BanList::new(config.ip_pepper.clone())),
             ban_list_file: config.ban_list_file.clone(),
@@ -84,6 +94,10 @@ impl AppState {
             download_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.max_concurrent_downloads,
             )),
+            backend_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("fixed backend HTTP client configuration must be valid"),
         }
     }
 }

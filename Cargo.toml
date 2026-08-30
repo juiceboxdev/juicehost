@@ -13,7 +13,7 @@ publish = false
 default = ["mimalloc", "quic"]
 mimalloc = ["dep:mimalloc"]
 quic = [
-    "juiceutils/quic",
+    "juicehost-juiceutils/quic",
 ]
 
 [dependencies]
@@ -43,7 +43,7 @@ async-trait = "0.1"
 utoipa = { version = "5", features = ["axum_extras"] }
 sentry = { version = "0.48", features = ["tower", "tower-axum-matched-path"] }
 sentry-tracing = "0.48"
-juiceutils = { path = "juiceutils" }
+juicehost-juiceutils = { path = "juiceutils" }
 
 [dev-dependencies]
 tempfile = "3"
