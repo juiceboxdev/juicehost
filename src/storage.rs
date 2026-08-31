@@ -609,6 +609,13 @@ impl StorageBackend for LocalBackend {
         id: &str,
         capability: &str,
     ) -> Result<bool, StorageError> {
+        // If the blob is already gone there is nothing to protect, so report it
+        // as not-found rather than failing on a missing/stale capability file.
+        // This lets cleanup purge orphaned rows without weakening auth for
+        // files that still exist on disk (those still require a valid capability).
+        if self.extensions.get(id).is_none() {
+            return Ok(false);
+        }
         self.verify_capability(id, capability).await?;
         self.delete(id).await
     }
@@ -1188,6 +1195,14 @@ impl StorageBackend for S3Backend {
         id: &str,
         capability: &str,
     ) -> Result<bool, StorageError> {
+        use futures::StreamExt;
+        // If the blob is already gone there is nothing to protect, so report it
+        // as not-found rather than failing on a missing/stale capability file.
+        let prefix = object_store::path::Path::from(format!("files/{}.", id));
+        let mut list = self.client.list(Some(&prefix));
+        if list.next().await.is_none() {
+            return Ok(false);
+        }
         self.verify_capability(id, capability).await?;
         self.delete(id).await
     }
