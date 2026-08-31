@@ -776,6 +776,7 @@ pub async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         header::CONTENT_TYPE,
         header::HeaderValue::from_static("application/json"),
     );
+    sentry::metrics::counter("juicehost.health", 1).capture();
     resp
 }
 

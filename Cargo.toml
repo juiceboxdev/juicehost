@@ -41,8 +41,8 @@ libc = "0.2"
 object_store = { version = "0.14", default-features = false, features = ["aws"] }
 async-trait = "0.1"
 utoipa = { version = "5", features = ["axum_extras"] }
-sentry = { version = "0.48", features = ["tower", "tower-axum-matched-path"] }
-sentry-tracing = "0.48"
+sentry = { version = "0.48", features = ["tower", "tower-axum-matched-path", "logs", "metrics"] }
+sentry-tracing = { version = "0.48", features = ["logs"] }
 juicehost-juiceutils = { path = "juiceutils" }
 
 [dev-dependencies]
