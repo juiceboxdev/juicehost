@@ -1008,7 +1008,8 @@ impl StorageBackend for S3Backend {
 
         let payload = object_store::PutPayload::from(data);
 
-        self.client
+        let result = self
+            .client
             .put_opts(
                 &path,
                 payload,
@@ -1017,9 +1018,9 @@ impl StorageBackend for S3Backend {
                     ..Default::default()
                 },
             )
-            .await?;
+            .await;
         self.release_id(&reservation).await;
-        Ok(())
+        result.map(|_| ()).map_err(Into::into)
     }
 
     async fn put_with_capability(
@@ -1089,7 +1090,11 @@ impl StorageBackend for S3Backend {
             self.release_id(&reservation).await;
             return Err(StorageError::Io(format!("S3 upload failed: {e}")));
         }
-        self.client.copy_if_not_exists(&temp_path, &path).await?;
+        if let Err(error) = self.client.copy_if_not_exists(&temp_path, &path).await {
+            let _ = self.client.delete(&temp_path).await;
+            self.release_id(&reservation).await;
+            return Err(error.into());
+        }
         if let Err(e) = self.client.delete(&temp_path).await {
             tracing::warn!("failed to remove S3 temp object {}: {}", temp_path, e);
         }
@@ -1192,7 +1197,10 @@ impl StorageBackend for S3Backend {
         let source = Self::object_key(old_id, &meta.extension);
         let target = Self::object_key(new_id, &meta.extension);
         let reservation = self.reserve_id(new_id).await?;
-        self.client.copy_if_not_exists(&source, &target).await?;
+        if let Err(error) = self.client.copy_if_not_exists(&source, &target).await {
+            self.release_id(&reservation).await;
+            return Err(error.into());
+        }
         self.release_id(&reservation).await;
         self.delete(old_id).await?;
         Ok(())
@@ -1372,9 +1380,15 @@ impl StorageBackend for S3Backend {
             self.release_id(&reservation).await;
             return Err(StorageError::Io(format!("S3 concat upload failed: {e}")));
         }
-        self.client
+        if let Err(error) = self
+            .client
             .copy_if_not_exists(&temp_path, &target_path)
-            .await?;
+            .await
+        {
+            let _ = self.client.delete(&temp_path).await;
+            self.release_id(&reservation).await;
+            return Err(error.into());
+        }
         let _ = self.client.delete(&temp_path).await;
         self.release_id(&reservation).await;
 

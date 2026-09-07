@@ -47,6 +47,8 @@ fn test_config(ticket_secret: &str, frontend_url: Option<String>) -> Config {
         tcp_max_concurrent_requests: 512,
         quick_link: false,
         custom_id: false,
+        file_cache_enabled: false,
+        file_cache_max_age_secs: 3600,
         default_ttl_hours: 24.0,
         allowed_ttl_hours: vec![1.0, 24.0, 168.0],
         ticket_jwt_secret: ticket_secret.into(),
@@ -195,6 +197,7 @@ async fn serve_not_found() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
 }
 
 #[tokio::test]
@@ -249,6 +252,7 @@ async fn serve_etag_304() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
     let etag = resp.headers().get("etag").unwrap().clone();
 
     let app = test_state(dir.path()).await;
@@ -264,6 +268,7 @@ async fn serve_etag_304() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
 }
 
 #[tokio::test]
@@ -288,6 +293,7 @@ async fn ranges_clamp_and_return_416() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()["cache-control"], "no-store");
     assert_eq!(response.headers()["content-range"], "bytes 7-9/10");
     assert_eq!(
         axum::body::to_bytes(response.into_body(), 32)
@@ -308,6 +314,7 @@ async fn ranges_clamp_and_return_416() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(response.headers()["cache-control"], "no-store");
     assert_eq!(response.headers()["content-range"], "bytes */10");
 }
 
