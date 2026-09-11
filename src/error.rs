@@ -39,6 +39,9 @@ pub enum StorageError {
     /// The storage backend has run out of space.
     #[error("insufficient storage")]
     InsufficientStorage,
+    /// The supplied per-file capability did not authorize the operation.
+    #[error("invalid file capability")]
+    Forbidden,
     /// An I/O or backend-specific error occurred.
     #[error("{0}")]
     Io(String),
@@ -52,6 +55,7 @@ impl From<StorageError> for JuicehostError {
             StorageError::PayloadTooLarge => JuicehostError::PayloadTooLarge,
             StorageError::SizeMismatch => JuicehostError::SizeMismatch,
             StorageError::InsufficientStorage => JuicehostError::InsufficientStorage,
+            StorageError::Forbidden => JuicehostError::Forbidden,
             StorageError::Io(_) => JuicehostError::InternalServerError,
         }
     }

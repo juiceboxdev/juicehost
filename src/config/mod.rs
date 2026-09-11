@@ -79,6 +79,8 @@ pub struct Config {
     /// Features Settings
     pub quick_link: bool,
     pub custom_id: bool,
+    pub file_cache_enabled: bool,
+    pub file_cache_max_age_secs: u64,
     pub default_ttl_hours: f64,
     pub allowed_ttl_hours: Vec<f64>,
     /// Secrets
@@ -140,6 +142,8 @@ impl Config {
             tcp_max_concurrent_requests: limits.tcp_max_concurrent_requests(),
             quick_link: features.quick_link(),
             custom_id: features.custom_id(),
+            file_cache_enabled: features.file_cache_enabled(),
+            file_cache_max_age_secs: features.file_cache_max_age_secs(),
             default_ttl_hours: features.default_ttl_hours(),
             allowed_ttl_hours: features.allowed_ttl_hours().to_owned(),
             ticket_jwt_secret: secrets.ticket_jwt_secret().to_owned(),

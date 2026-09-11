@@ -16,8 +16,82 @@ use crate::error::{not_found_html, teapot_html, JuicehostError};
 use crate::state::AppState;
 use crate::storage;
 
-/// Maximum Cache-Control max-age for immutable file responses (1 year in seconds).
-const CACHE_MAX_AGE: &str = "public, max-age=31536000, immutable";
+#[derive(serde::Deserialize)]
+pub struct RenameRequest {
+    new_id: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ConcatRequest {
+    target_id: String,
+    #[serde(default = "default_concat_filename")]
+    filename: String,
+    parts: Vec<String>,
+}
+
+fn default_concat_filename() -> String {
+    "upload.bin".into()
+}
+
+fn optional_file_capability(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-juicehost-file-capability")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn required_file_capability(
+    headers: &HeaderMap,
+    api_key: &str,
+) -> Result<Option<String>, JuicehostError> {
+    let has_api_key = headers
+        .get("x-juicehost-api-key")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|provided| juiceutils::constant_time_eq(api_key, provided));
+    if !api_key.is_empty() && has_api_key {
+        return Ok(None);
+    }
+    optional_file_capability(headers)
+        .ok_or(JuicehostError::Forbidden)
+        .map(Some)
+}
+
+/// Actually it is a bad idea to cache files on juicehost
+/// Perhaps making this configurable using config?
+const FILE_CACHE_CONTROL: &str = "no-store";
+
+fn file_cache_control_value(state: &AppState, ttl_remaining_secs: Option<u64>) -> String {
+    if !state.file_cache_enabled {
+        return FILE_CACHE_CONTROL.to_string();
+    }
+    match ttl_remaining_secs {
+        Some(secs) if secs > 0 => {
+            let age = secs.min(state.file_cache_max_age_secs);
+            format!("public, max-age={age}, s-maxage={age}")
+        }
+        _ => FILE_CACHE_CONTROL.to_string(),
+    }
+}
+
+async fn remaining_ttl_secs(state: &AppState, id: &str) -> Option<u64> {
+    if !state.file_cache_enabled {
+        return None;
+    }
+    let backend_url = state.backend_url.as_ref()?;
+    let status_url = format!("{}/internal/file/{}/status", backend_url, id);
+    let resp = backend_request(state, status_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.json::<serde_json::Value>().await.ok()?;
+    let expires_at = body.get("expires_at")?.as_i64()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some((expires_at - now).max(0) as u64)
+}
 
 /// Header sent on peer health probes. The receiving side skips probing back so
 /// juiceback and juicehost don't recurse into each other's /api/health forever.
@@ -46,8 +120,25 @@ pub async fn index_handler(State(state): State<Arc<AppState>>) -> Response {
 fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
         && id
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+fn backend_request(state: &AppState, url: String) -> reqwest::RequestBuilder {
+    let request = state.backend_client.get(url);
+    if state.api_key.is_empty() {
+        request
+    } else {
+        request.header("x-juicehost-api-key", &state.api_key)
+    }
+}
+
+fn prevent_file_caching(mut response: Response<Body>) -> Response<Body> {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static(FILE_CACHE_CONTROL),
+    );
+    response
 }
 
 /// Serve `/f/*path`; the optional extension is ignored for lookup.
@@ -76,7 +167,7 @@ async fn serve_file_inner(
             // File not on disk. Check juiceback to see if it's still uploading.
             if let Some(ref backend_url) = state.backend_url {
                 let status_url = format!("{}/internal/file/{}/status", backend_url, id);
-                match reqwest::get(&status_url).await {
+                match backend_request(&state, status_url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         if let Ok(body) = resp.json::<serde_json::Value>().await {
                             if body.get("status").and_then(|s| s.as_str()) == Some("uploading") {
@@ -84,7 +175,9 @@ async fn serve_file_inner(
                                     .get("filename")
                                     .and_then(|s| s.as_str())
                                     .unwrap_or("upload");
-                                return Ok(teapot_html(filename, "", "").into_response());
+                                return Ok(prevent_file_caching(
+                                    teapot_html(filename, "", "").into_response(),
+                                ));
                             }
                         }
                     }
@@ -95,13 +188,14 @@ async fn serve_file_inner(
             // Check whether this is an old ID that was renamed.
             if let Some(ref backend_url) = state.backend_url {
                 let alias_url = format!("{}/internal/alias/{}", backend_url, id);
-                if let Ok(resp) = reqwest::get(&alias_url).await {
+                if let Ok(resp) = backend_request(&state, alias_url).send().await {
                     if resp.status().is_success() {
                         if let Ok(body) = resp.json::<serde_json::Value>().await {
                             if let Some(new_url) = body.get("url").and_then(|u| u.as_str()) {
                                 return Response::builder()
                                     .status(StatusCode::MOVED_PERMANENTLY)
                                     .header(header::LOCATION, new_url)
+                                    .header(header::CACHE_CONTROL, FILE_CACHE_CONTROL)
                                     .body(Body::empty())
                                     .map_err(|_| JuicehostError::InternalServerError);
                             }
@@ -110,22 +204,39 @@ async fn serve_file_inner(
                 }
             }
 
-            return Ok(not_found_html().into_response());
+            return Ok(prevent_file_caching(not_found_html().into_response()));
         }
-        Err(_) => return Ok(not_found_html().into_response()),
+        Err(_) => return Ok(prevent_file_caching(not_found_html().into_response())),
     };
 
     let etag = &file_meta.etag;
 
+    let ttl_remaining = remaining_ttl_secs(&state, &id).await;
+    let cache_control = file_cache_control_value(&state, ttl_remaining);
+    let cache_tag = if cache_control == FILE_CACHE_CONTROL {
+        None
+    } else {
+        Some(format!("juicebox:{id}"))
+    };
+    let with_cache_headers = |mut builder: axum::http::response::Builder| {
+        builder = builder.header(header::CACHE_CONTROL, &cache_control);
+        if let Some(tag) = &cache_tag {
+            builder = builder
+                .header(header::HeaderName::from_static("cache-tag"), tag);
+        }
+        builder
+    };
+
     if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH) {
         if let Ok(val) = if_none_match.to_str() {
             if val.trim_matches('"') == etag.trim_matches('"') {
-                return Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(header::CACHE_CONTROL, CACHE_MAX_AGE)
-                    .header(header::ETAG, etag)
-                    .body(Body::empty())
-                    .map_err(|_| JuicehostError::InternalServerError);
+                return with_cache_headers(
+                    Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .header(header::ETAG, etag),
+                )
+                .body(Body::empty())
+                .map_err(|_| JuicehostError::InternalServerError);
             }
         }
     }
@@ -150,27 +261,30 @@ async fn serve_file_inner(
                         let _ = &permit;
                         item
                     });
-                    return Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header(header::CONTENT_TYPE, &mime_str)
-                        .header(header::CONTENT_LENGTH, content_len)
-                        .header(
-                            header::CONTENT_RANGE,
-                            format!("bytes {}-{}/{}", start, end, total_size),
-                        )
-                        .header(header::CACHE_CONTROL, CACHE_MAX_AGE)
-                        .header(header::ETAG, etag)
-                        .header(header::ACCEPT_RANGES, "bytes")
-                        .body(Body::from_stream(stream))
-                        .map_err(|_| JuicehostError::InternalServerError);
+                    return with_cache_headers(
+                        Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header(header::CONTENT_TYPE, &mime_str)
+                            .header(header::CONTENT_LENGTH, content_len)
+                            .header(
+                                header::CONTENT_RANGE,
+                                format!("bytes {}-{}/{}", start, end, total_size),
+                            )
+                            .header(header::ETAG, etag)
+                            .header(header::ACCEPT_RANGES, "bytes"),
+                    )
+                    .body(Body::from_stream(stream))
+                    .map_err(|_| JuicehostError::InternalServerError);
                 }
                 RangeResult::Unsatisfiable => {
-                    return Response::builder()
-                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                        .header(header::CONTENT_RANGE, format!("bytes */{total_size}"))
-                        .header(header::ACCEPT_RANGES, "bytes")
-                        .body(Body::empty())
-                        .map_err(|_| JuicehostError::InternalServerError);
+                    return with_cache_headers(
+                        Response::builder()
+                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .header(header::CONTENT_RANGE, format!("bytes */{total_size}"))
+                            .header(header::ACCEPT_RANGES, "bytes"),
+                    )
+                    .body(Body::empty())
+                    .map_err(|_| JuicehostError::InternalServerError);
                 }
                 RangeResult::Ignore => {}
             }
@@ -188,15 +302,16 @@ async fn serve_file_inner(
     });
     let body = Body::from_stream(stream);
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, &mime_str)
-        .header(header::CONTENT_LENGTH, total_size)
-        .header(header::CACHE_CONTROL, CACHE_MAX_AGE)
-        .header(header::ETAG, etag)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .body(body)
-        .map_err(|_| JuicehostError::InternalServerError)
+    with_cache_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, &mime_str)
+            .header(header::CONTENT_LENGTH, total_size)
+            .header(header::ETAG, etag)
+            .header(header::ACCEPT_RANGES, "bytes"),
+    )
+    .body(body)
+    .map_err(|_| JuicehostError::InternalServerError)
 }
 
 /// Parse a `Range: bytes=START-END` header.
@@ -278,6 +393,7 @@ fn parse_range(range_val: &str, total_size: u64, max_len: u64) -> RangeResult {
 #[tracing::instrument(skip_all)]
 pub async fn store_file(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, JuicehostError> {
     let _permit = Arc::clone(&state.upload_semaphore)
@@ -331,15 +447,32 @@ pub async fn store_file(
         &format!("(id={file_id})"),
     )?;
 
-    state
-        .storage
-        .put(
-            &file_id,
-            &content_filename(&filename, infer::get(&data).as_ref()),
-            data,
-        )
-        .await
-        .map_err(JuicehostError::from)?;
+    let capability = optional_file_capability(&headers);
+
+    match capability {
+        Some(cap) => {
+            state
+                .storage
+                .put_with_capability(
+                    &file_id,
+                    &content_filename(&filename, infer::get(&data).as_ref()),
+                    data,
+                    &cap,
+                )
+                .await
+        }
+        None => {
+            state
+                .storage
+                .put(
+                    &file_id,
+                    &content_filename(&filename, infer::get(&data).as_ref()),
+                    data,
+                )
+                .await
+        }
+    }
+    .map_err(JuicehostError::from)?;
 
     tracing::info!("stored file: {} ({})", file_id, filename);
 
@@ -365,23 +498,28 @@ pub async fn store_file(
 )]
 pub async fn rename_file(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
-    Json(payload): Json<serde_json::Value>,
+    Json(payload): Json<RenameRequest>,
 ) -> Result<Json<serde_json::Value>, JuicehostError> {
-    let new_id = payload
-        .get("new_id")
-        .and_then(|v| v.as_str())
-        .ok_or(JuicehostError::BadRequest)?;
+    let new_id = payload.new_id;
 
-    if !is_valid_id(new_id) {
+    if !is_valid_id(&new_id) {
         return Err(JuicehostError::BadRequest);
     }
 
-    state
-        .storage
-        .rename(&id, new_id)
-        .await
-        .map_err(JuicehostError::from)?;
+    let capability = required_file_capability(&headers, &state.api_key)?;
+
+    match capability {
+        Some(cap) => {
+            state
+                .storage
+                .rename_with_capability(&id, &new_id, &cap)
+                .await
+        }
+        None => state.storage.rename(&id, &new_id).await,
+    }
+    .map_err(JuicehostError::from)?;
 
     tracing::info!("renamed file: {} -> {}", id, new_id);
 
@@ -408,13 +546,16 @@ pub async fn rename_file(
 )]
 pub async fn delete_file(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, JuicehostError> {
-    let deleted = state
-        .storage
-        .delete(&id)
-        .await
-        .map_err(JuicehostError::from)?;
+    let capability = required_file_capability(&headers, &state.api_key)?;
+
+    let deleted = match capability {
+        Some(cap) => state.storage.delete_with_capability(&id, &cap).await,
+        None => state.storage.delete(&id).await,
+    }
+    .map_err(JuicehostError::from)?;
 
     if !deleted {
         return Err(JuicehostError::NotFound);
@@ -549,7 +690,7 @@ fn content_filename(filename: &str, detected: Option<&infer::Type>) -> String {
 pub async fn store_file_streaming(
     State(state): State<Arc<AppState>>,
     Path((id, filename)): Path<(String, String)>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: axum::body::Body,
 ) -> Result<Json<serde_json::Value>, JuicehostError> {
     if !is_valid_id(&id) {
@@ -561,15 +702,28 @@ pub async fn store_file_streaming(
         .map_err(|_| JuicehostError::ServiceUnavailable)?;
     let handler_start = std::time::Instant::now();
 
+    let capability = optional_file_capability(&headers);
+
     let (body, detected) = sniff_and_validate(body, &filename, state.danger_level).await?;
     let max_size = state.max_file_size_bytes;
     let stream = sized_stream(body, max_size, None);
     let storage_filename = content_filename(&filename, detected.as_ref());
-    let total = state
-        .storage
-        .put_stream(&id, &storage_filename, Box::pin(stream))
-        .await
-        .map_err(JuicehostError::from)?;
+
+    let total = match capability {
+        Some(cap) => {
+            state
+                .storage
+                .put_stream_with_capability(&id, &storage_filename, Box::pin(stream), &cap)
+                .await
+        }
+        None => {
+            state
+                .storage
+                .put_stream(&id, &storage_filename, Box::pin(stream))
+                .await
+        }
+    }
+    .map_err(JuicehostError::from)?;
 
     let total_time = handler_start.elapsed();
     let bytes_per_sec = if total_time.as_secs_f64() > 0.0 {
@@ -606,11 +760,12 @@ pub async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     // Skip the peer probe when this request was itself a health probe.
     if !headers.contains_key(HEALTH_PROBE_HEADER) {
         if let Some(ref backend_url) = state.backend_url {
-            body["juiceback"] = serde_json::json!(if check_backend_health(backend_url).await {
-                "ok"
-            } else {
-                "unreachable"
-            });
+            body["juiceback"] =
+                serde_json::json!(if check_backend_health(&state, backend_url).await {
+                    "ok"
+                } else {
+                    "unreachable"
+                });
         }
     }
 
@@ -623,16 +778,9 @@ pub async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 }
 
 /// Probes the juiceback health endpoint if it is configured
-async fn check_backend_health(backend_url: &str) -> bool {
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    else {
-        return false;
-    };
+async fn check_backend_health(state: &AppState, backend_url: &str) -> bool {
     let url = format!("{}/api/health", backend_url.trim_end_matches('/'));
-    let Ok(resp) = client
-        .get(&url)
+    let Ok(resp) = backend_request(state, url)
         .header(HEALTH_PROBE_HEADER, "1")
         .send()
         .await
@@ -680,29 +828,18 @@ pub async fn storage_handler(State(state): State<Arc<AppState>>) -> Json<storage
 )]
 pub async fn concat_files(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<serde_json::Value>,
+    headers: HeaderMap,
+    Json(payload): Json<ConcatRequest>,
 ) -> Result<Json<serde_json::Value>, JuicehostError> {
-    let target_id = payload
-        .get("target_id")
-        .and_then(|v| v.as_str())
-        .ok_or(JuicehostError::BadRequest)?;
-
-    let filename = payload
-        .get("filename")
-        .and_then(|v| v.as_str())
-        .unwrap_or("upload.bin");
-
-    let parts: Vec<&str> = payload
-        .get("parts")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.iter().map(|v| v.as_str()).collect())
-        .ok_or(JuicehostError::BadRequest)?;
+    let target_id = payload.target_id;
+    let filename = payload.filename;
+    let parts: Vec<&str> = payload.parts.iter().map(String::as_str).collect();
 
     let unique: std::collections::HashSet<_> = parts.iter().copied().collect();
     if parts.is_empty()
         || parts.len() > state.max_concat_parts
         || unique.len() != parts.len()
-        || !is_valid_id(target_id)
+        || !is_valid_id(&target_id)
         || parts.iter().any(|id| !is_valid_id(id) || *id == target_id)
     {
         return Err(JuicehostError::BadRequest);
@@ -727,11 +864,18 @@ pub async fn concat_files(
         .try_acquire_owned()
         .map_err(|_| JuicehostError::ServiceUnavailable)?;
 
-    state
-        .storage
-        .concat(target_id, filename, &parts)
-        .await
-        .map_err(JuicehostError::from)?;
+    let capability = required_file_capability(&headers, &state.api_key)?;
+
+    match capability {
+        Some(cap) => {
+            state
+                .storage
+                .concat_with_capability(&target_id, &filename, &parts, &cap)
+                .await
+        }
+        None => state.storage.concat(&target_id, &filename, &parts).await,
+    }
+    .map_err(JuicehostError::from)?;
 
     tracing::info!("concat: {} <- {:?} ({})", target_id, parts, filename);
 
@@ -797,6 +941,7 @@ pub async fn store_file_ticket(
         file_id: String,
         filename: String,
         file_size: u64,
+        file_capability: Option<String>,
     }
 
     use jsonwebtoken::{decode, DecodingKey};
@@ -839,14 +984,31 @@ pub async fn store_file_ticket(
 
     let handler_start = std::time::Instant::now();
 
+    let capability = ticket
+        .claims
+        .file_capability
+        .clone()
+        .or_else(|| optional_file_capability(&headers));
+
     let (body, detected) = sniff_and_validate(body, &real_filename, state.danger_level).await?;
     let stream = sized_stream(body, ticket.claims.file_size, Some(ticket.claims.file_size));
     let storage_filename = content_filename(&real_filename, detected.as_ref());
-    let total = state
-        .storage
-        .put_stream(&id, &storage_filename, Box::pin(stream))
-        .await
-        .map_err(JuicehostError::from)?;
+
+    let total = match capability {
+        Some(cap) => {
+            state
+                .storage
+                .put_stream_with_capability(&id, &storage_filename, Box::pin(stream), &cap)
+                .await
+        }
+        None => {
+            state
+                .storage
+                .put_stream(&id, &storage_filename, Box::pin(stream))
+                .await
+        }
+    }
+    .map_err(JuicehostError::from)?;
 
     let total_time = handler_start.elapsed();
     let bytes_per_sec = if total_time.as_secs_f64() > 0.0 {
@@ -997,6 +1159,11 @@ mod tests {
     #[test]
     fn is_valid_id_with_underscores_and_dashes() {
         assert!(is_valid_id("my_file-123"));
+    }
+
+    #[test]
+    fn is_valid_id_rejects_non_ascii_alphanumeric() {
+        assert!(!is_valid_id("cafe-é"));
     }
 
     #[test]

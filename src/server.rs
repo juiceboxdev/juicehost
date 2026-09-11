@@ -73,6 +73,10 @@ async fn require_api_key(
         return next.run(req).await;
     }
 
+    if req.headers().contains_key("x-juicehost-file-capability") {
+        return next.run(req).await;
+    }
+
     let provided_key = req
         .headers()
         .get("x-juicehost-api-key")
@@ -276,6 +280,11 @@ pub async fn start_server(app: Router, addr: SocketAddr, max_concurrent_requests
 pub fn print_startup_banner(config: &Config) {
     println!("{}", BANNER_ART);
     tracing::info!("juicehost v{} starting", env!("CARGO_PKG_VERSION"));
+    if config.api_key.is_empty() {
+        tracing::warn!(
+            "JUICEHOST_API_KEY is not set: internal API authentication is disabled; use per-file capabilities for destructive operations"
+        );
+    }
     if config.is_s3_mode() {
         tracing::info!(
             "storage: S3 (bucket={})",
